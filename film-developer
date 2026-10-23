@@ -1,0 +1,43 @@
+#!/bin/sh
+# The command, straight from a clone, with no environment to think about.
+#
+#     ./film-developer --help
+#     ./film-developer detect my-roll/
+#     ./film-developer gui    my-roll/
+#     ./film-developer apply  my-roll/
+#
+# It is the same command that `uv pip install -e .` puts on the PATH; this file
+# only saves having to build or activate anything first. `uv run` does the work
+# -- it syncs the environment on demand -- and every argument is passed straight
+# through, so anything the command accepts works here unchanged.
+#
+# It runs `python -m film_developer` rather than the installed script of the
+# same name: this file *is* called film-developer, and a PATH with `.` on it
+# would otherwise send it round in circles.
+#
+# The `gui` extra is asked for only when something actually wants the editor,
+# so a headless detect or apply never drags Qt in.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+
+# No subcommand means the editor, so that needs Qt too -- same rule as cli.py.
+extra=
+case "$1" in
+    ""|-*) ;;
+    detect|apply) ;;
+    *) extra="--extra gui" ;;
+esac
+[ "$1" = "gui" ] && extra="--extra gui"
+[ -z "$1" ] && extra="--extra gui"
+for a in "$@"; do
+    [ "$a" = "--gui" ] && extra="--extra gui"
+done
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --project "$here" $extra python -m film_developer "$@"
+elif [ -x "$here/.venv/bin/python" ]; then
+    exec "$here/.venv/bin/python" -m film_developer "$@"
+else
+    echo "film-developer: needs uv (https://docs.astral.sh/uv/), or a .venv" >&2
+    exit 1
+fi

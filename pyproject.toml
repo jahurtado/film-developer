@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "film-developer"
+dynamic = ["version"]
+description = "Find the picture inside a photographed negative: crop it, straighten it, and keep it raw."
+authors = [{ name = "Jose A. Hurtado" }]
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "rawpy>=0.19",            # LibRaw: NEF, CR2, CR3, DNG in
+    "tifffile>=2024.1.30",    # DNG/TIFF structure, on the way out
+    "imagecodecs>=2024.1.1",  # the codecs tifffile needs for DNG
+    "Pillow>=10",             # JPEG, and the previews
+]
+
+[project.urls]
+Homepage = "https://elcacharrista.com"
+
+[project.optional-dependencies]
+# The editor is a Qt application. Kept behind an extra so a headless machine,
+# which can detect and apply perfectly well, never installs a toolkit it has no
+# screen for.
+gui = ["PySide6>=6.6"]
+# Building the macOS bundle. Not needed to run anything, and heavy, so it stays
+# out of the way until somebody asks for a .dmg.
+mac = ["PySide6>=6.6", "pyinstaller>=6.10"]
+# Building the Windows bundle. No PyInstaller: the Windows build lays wheels
+# beside an embeddable CPython instead of freezing a binary.
+win = ["PySide6>=6.6"]
+
+[project.scripts]
+film-developer = "film_developer.cli:main"
+
+# One source of truth for the version: the package itself, so `--version` and
+# the installed metadata cannot drift apart.
+[tool.hatch.version]
+path = "src/film_developer/__init__.py"

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+*.egg-info/
+build/
+dist/
+
+# The document, written next to the scans it is about.
+frames.json
+
+# The desktop bundles and their wrappers, all built from packaging/.
+packaging/build/
+packaging/dist/
