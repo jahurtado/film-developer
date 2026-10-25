@@ -36,16 +36,16 @@ the order the roll was shot. The app never writes over your original scans.
 
 ## Install
 
-Download it from the
-[latest release](https://github.com/jahurtado/film-developer/releases/latest):
+- **macOS** (Apple Silicon): `film-developer-0.2.0-arm64.dmg`, from the
+  [v0.2.0 release](https://github.com/jahurtado/film-developer/releases/tag/v0.2.0)
+- **Windows** (x64): the installer `film-developer-0.1.0-x64-setup.exe`, or
+  the portable `film-developer-0.1.0-x64.zip` (unpack it and run
+  `film-developer.cmd`), from the
+  [v0.1.0 release](https://github.com/jahurtado/film-developer/releases/tag/v0.1.0).
+  The Windows build of 0.2.0 is not ready yet.
 
-- **macOS** (Apple Silicon): `film-developer-VERSION-arm64.dmg`
-- **Windows** (x64): the installer `film-developer-VERSION-x64-setup.exe`,
-  or the portable `film-developer-VERSION-x64.zip` (unpack it and run
-  `film-developer.cmd`)
-
-The checksums are in `SHA256SUMS`. Each download includes Python and all the
-libraries, so you don't need to install anything else.
+The checksums are in `SHA256SUMS` in each release. Each download includes
+Python and all the libraries, so you don't need to install anything else.
 
 The apps are not signed, so macOS and Windows show a warning the first time
 you open them. On macOS, go to System Settings → Privacy & Security and
