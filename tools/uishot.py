@@ -150,7 +150,7 @@ def main(argv=None):
         # The sheet is a question, not logic: it is answered rather than
         # clicked, so the body that does the work is the real one.
         from film_developer import processing
-        processing.ask = lambda d, parent=None: {
+        processing.ask = lambda d, parent=None, *_: {
             "positives": True, "format": taste.get("format", "jpeg"),
             "raws": bool(args.raws), "crop": "outer"}
         t = time.monotonic()

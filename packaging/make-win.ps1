@@ -160,7 +160,7 @@ recognise the publisher. Click "More info", then "Run anyway". Once is enough.
 It carries everything it needs. Nothing has to be installed beside it.
 
 x64 Windows only. To run from source instead, see:
-https://www.elcacharrista.com
+https://github.com/jahurtado/film-developer#run-from-source
 '@
 Set-Content -Path (Join-Path $payload "First launch.txt") -Value $note -Encoding utf8
 

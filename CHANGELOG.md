@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.0
+
+- Dust is painted with a brush. A click paints a round dab and a drag
+  paints a stroke. You can change the size of a mark after you make it.
+  Marks from 0.1.0 are converted when you open the roll.
+- The dust view shows the frame cleaned while you mark it. `v` shows or
+  hides the marks, and holding `c` shows the original.
+- `⌘` + drag on a mark chooses where it is cloned from.
+- `⌘Z` and `⇧⌘Z` undo and redo dust marks.
+- Large dust marks clean about ten times faster.
+- `⇧⌘R` processes only the photo on screen. From the command line,
+  `process --only SCAN`.
+- `⇧B` can pick the film base for the whole roll, not only for one scan.
+  Only its colour is used, so each scan keeps its own level. From the
+  command line, `roll --pick-base` and `--no-picked-base`.
+- Holding `c` in the main window shows the developed photo with its dust.
+- The key list is grouped by area: view, crop, colour, dust and process.
+  One row for each key, so every row can be clicked. The names are shorter.
+- `⌘L` opens the roll look and `⇧⌘L` the light falloff calibration (they
+  were `⌘K` and `⌘L`). `⌫` resets a frame in the crop mode, and `e` leaves
+  it.
+- The dust finder and the patch sweep are gone from the window.
+- The About box shows the icon and the version.
+- The first-launch notes link to this repository.
+
 ## 0.1.0
 
 The first release.

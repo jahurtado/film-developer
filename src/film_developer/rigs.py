@@ -8,7 +8,7 @@ same thing for a script. Two sheets:
   fitted, shown -- how well it fits, how well it predicts a blank it was
   not fitted on, how much the light falls at the corners -- and kept only
   if you say so. A calibration nobody looked at is one nobody can trust.
-- **Light falloff** (`⌘L` in the editor): which calibration this roll
+- **Light falloff** (`⇧⌘L` in the editor): which calibration this roll
   divides out, with what each one is -- its camera, its blanks, its fit --
   and a warning where it is for another camera or sensor, because then it
   is another stand's light.

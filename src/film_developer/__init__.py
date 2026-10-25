@@ -12,4 +12,4 @@ estimators), `image_io` (raw in, DNG out) and `document` (the format of what
 sits between the three).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

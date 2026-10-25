@@ -38,12 +38,18 @@ SQUEEZE_SAY = ("bit for bit the same, at about 3/4 of the size (the negatives' "
 WARN = "#ffb340"
 
 
-def ask(doc, parent=None):
+def ask(doc, parent=None, chosen=(), alone=False):
     """The choices, or None if the sheet was closed.
 
     {"positives": bool, "format": "jpeg"|"tiff16",
      "raws": bool, "crop": "outer"|"inner", "dust": bool, "negatives": bool,
-     "numbered": bool, "compress": bool}
+     "numbered": bool, "compress": bool, "only": None | [scan names]}
+
+    `chosen` are the scans chosen in the list, or the one on screen: the
+    sheet offers them alone as well as the whole roll. **A photo can be
+    processed alone** -- marking its dust, or setting the roll's look on
+    it, and wanting to see the file -- without paying the roll for it.
+    `alone` (`⇧⌘R`) opens the sheet on that choice.
     """
     from . import dust as dust_
     marks = [len([m for m in (v.get("marks") or []) if dust_.used(m)])
@@ -64,6 +70,27 @@ def ask(doc, parent=None):
     head = QLabel("What should come out of this roll?")
     head.setStyleSheet("font-size: 15px;")
     v.addWidget(head)
+
+    chosen = [n for n in chosen if n in (doc.get("items") or {})
+              and doc["items"][n].get("state") != "skipped"
+              and doc["items"][n].get("parts")]
+    whole = QRadioButton("The whole roll")
+    whole.setChecked(True)
+    few = None
+    if chosen:
+        name = (chosen[0].rsplit(".", 1)[0] if len(chosen) == 1
+                else f"the {len(chosen)} chosen in the list")
+        few = QRadioButton("Only this photo, " + name if len(chosen) == 1
+                           else "Only " + name)
+        few.setToolTip('<qt><div style="white-space:normal" width="400">The '
+                       'rest of the roll\'s files are left as they are, and '
+                       'the folder\'s record keeps them.</div></qt>')
+        few.setChecked(alone)
+        which = QHBoxLayout()
+        which.addWidget(whole)
+        which.addWidget(few)
+        which.addStretch(1)
+        v.addLayout(which)
 
     pos = QCheckBox("Positives, developed")
     pos.setChecked(True)
@@ -222,7 +249,8 @@ def ask(doc, parent=None):
                    dust=clean.isEnabled() and clean.isChecked(),
                    negatives=neg.isEnabled() and neg.isChecked(),
                    numbered=numbered.isChecked(),
-                   compress=squeeze.isChecked())
+                   compress=squeeze.isChecked(),
+                   only=chosen if few is not None and few.isChecked() else None)
         dlg.accept()
     go.clicked.connect(take)
     dlg.exec()

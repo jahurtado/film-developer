@@ -63,13 +63,54 @@ BLUR_K = 2.0         # its height, in robust sigmas of the blurred residual: low
                      # because a hand mark is already the evidence; 2-4 % on DSC_0238
 BLUR_SMOOTH = 6.0    # scan px: the blur that takes the grain out before looking
 BLUR_AREA = 20000.0  # scan px²: the most a disc can be
+SIZED_REACH = 2.0    # a sized mark's speck stays within this many of its radii
+STROKE_R = 4.0       # scan px: a stroke's radius when none was given
+CLOSE = 3.0          # scan px: a gap this narrow between parts of a hole is filled too
+ISLAND = 400.0       # scan px²: the most picture a speck can close round and take
+
+
+def samples(mark):
+    """A mark as points in scan pixels: (x, y, r, painted).
+
+    A click is one point. **A stroke** -- a scratch or a hair painted by
+    dragging, `path` with a radius `r` -- is its path walked every half
+    radius, so the discs overlap into the band that was painted."""
+    path = mark.get("path")
+    if not path:
+        return [(mark["x"], mark["y"], mark.get("r"), False)]
+    r = float(mark.get("r") or STROKE_R)
+    if mark.get("soft"):
+        return [(float(path[0][0]), float(path[0][1]), r, "soft")]
+    # **Cloned from a place a person chose** (`from`, scan pixels from the
+    # mark to its source): every point of the mark says so, and which mark
+    # it is, so `clean` fills the mark from there as one piece
+    paint = (("from", float(mark["from"][0]), float(mark["from"][1]),
+              mark.get("id") or id(mark)) if mark.get("from") else True)
+    step = max(1.0, r / 2)
+    out = [(float(path[0][0]), float(path[0][1]), r, paint)]
+    for (x0, y0), (x1, y1) in zip(path, path[1:]):
+        n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / step)))
+        out += [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n, r, paint)
+                for i in range(1, n + 1)]
+    return out
 
 
 def points(marks, to_px):
-    """The marks through `to_px(x, y) -> (x, y)`, as (x, y, r): `r` is the
-    radius a person gave the mark, in scan pixels, or None to find the
-    speck's own extent."""
-    return [tuple(to_px(m["x"], m["y"])) + (m.get("r"),) for m in marks]
+    """The marks through `to_px(x, y) -> (x, y)`, as (x, y, r, painted):
+    `r` is the radius a person gave the mark, in scan pixels, or None to
+    find the speck's own extent; `painted` for a stroke's points, whose
+    disc is filled as it is (`samples`)."""
+    out = []
+    for m in marks:
+        for x, y, r, painted in samples(m):
+            at = tuple(to_px(x, y))
+            if isinstance(painted, tuple):
+                # the way to the source, turned and mirrored as the point is
+                to = to_px(x + painted[1], y + painted[2])
+                painted = ("from", float(to[0] - at[0]), float(to[1] - at[1]),
+                           painted[3])
+            out.append(at + (r, painted))
+    return out
 
 
 def clean(img, pts, scan_px, seed=0):
@@ -78,13 +119,50 @@ def clean(img, pts, scan_px, seed=0):
     pixel spans, so the sizes above mean the same on film at any scale.
     Returns a new array, or `img` itself when there is nothing to do."""
     H, W = img.shape[:2]
-    pts = [tuple(p) + (None,) * (3 - len(p)) for p in pts]
-    pts = [p for p in pts if -2 <= p[0] < W + 2 and -2 <= p[1] < H + 2]
+    pts = [tuple(p) + (None, False)[len(p) - 2:] for p in pts]
+    # a painted disc counts if any of it is on the picture, not only its
+    # middle: the window's live view cleans crops of the frame, and a dab
+    # just outside one is still part of what the frame would fill
+    reach = lambda p: 2 + (p[2] / scan_px if p[3] and p[2] else 0)
+    pts = [p for p in pts if -reach(p) <= p[0] < W + reach(p)
+           and -reach(p) <= p[1] < H + reach(p)]
     if not pts:
         return img
     out = img.copy()
     hole = np.zeros((H, W), bool)
-    for x, y, r in pts:
+    cloned = {}                 # mark -> (its mask, the way to its source)
+    for x, y, r, painted in pts:
+        if isinstance(painted, tuple):
+            rr = max(1.0, r / scan_px)
+            y0, y1 = max(0, int(y - rr - 1)), min(H, int(y + rr + 2))
+            x0, x1 = max(0, int(x - rr - 1)), min(W, int(x + rr + 2))
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            if painted[3] not in cloned:
+                cloned[painted[3]] = (np.zeros((H, W), bool),
+                                      painted[1] / scan_px, painted[2] / scan_px)
+            cloned[painted[3]][0][y0:y1, x0:x1] |= (xx - x) ** 2 + (yy - y) ** 2 <= rr * rr
+            continue
+        if painted == "soft":
+            # a soft disc of the rig's dust, brought over from a mark made
+            # before the brush (`migrate`): divided out as it was then. Not
+            # found -- a neighbour's division can have taken it, the four
+            # top left of DSC_0238 overlap -- it is what an old mark was
+            # then, a speck or a small disc, and never its whole radius
+            # filled: on DSC_0238 that was 77 000 px of sky made up
+            if not _blur(out, x, y, scan_px):
+                _speck(out, hole, x, y, scan_px, True)
+            continue
+        if painted:
+            # **A stroke is what was painted**, nothing grown: a scratch is
+            # a line a person has just drawn along, and growing a speck
+            # every half radius of it would follow whatever line of the
+            # picture it crosses -- the wire of DSC_0427 again
+            rr = max(1.0, r / scan_px)
+            y0, y1 = max(0, int(y - rr - 1)), min(H, int(y + rr + 2))
+            x0, x1 = max(0, int(x - rr - 1)), min(W, int(x + rr + 2))
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            hole[y0:y1, x0:x1] |= (xx - x) ** 2 + (yy - y) ** 2 <= rr * rr
+            continue
         if r:
             # **Sized by hand: the disc, and the speck under it too.** The
             # disc is what somebody drew round; the speck is grown as for
@@ -97,12 +175,78 @@ def clean(img, pts, scan_px, seed=0):
             x0, x1 = max(0, int(x - rr - 1)), min(W, int(x + rr + 2))
             yy, xx = np.mgrid[y0:y1, x0:x1]
             hole[y0:y1, x0:x1] |= (xx - x) ** 2 + (yy - y) ** 2 <= rr * rr
-            _speck(out, hole, x, y, scan_px, False)
+            _speck(out, hole, x, y, scan_px, False, SIZED_REACH * rr)
             continue
         if not _speck(out, hole, x, y, scan_px, False):
             if not _blur(out, x, y, scan_px):
                 _speck(out, hole, x, y, scan_px, True)
-    return fill(out, hole, np.random.default_rng(seed))
+    # **What a speck closes round is the speck's.** A hair that curls into
+    # a loop leaves the pixels inside it out of every mark, and they carry
+    # the hair's glow: on DSC_0427 of carrete_4 the loop at the tip of a
+    # hair sat over a pair of wires and came out as a light spot on them,
+    # with the hair round it gone. So a gap narrower than `CLOSE` between
+    # two parts of the hole goes in (a closing), and then a gap the hole
+    # encloses and no bigger than `ISLAND`: that loop was open on one side,
+    # 2-3 px, and a closing alone left a diamond inside it.
+    #
+    # Round each speck in its own box, not over the frame: on 24 MP the two
+    # took 0.7 s for a single 5 px dab. The box has `2k + 2` round it, so
+    # the closing sees everything it would over the frame, and an island
+    # is enclosed by the hole, so it is inside the box.
+    k = max(1, int(round(CLOSE / scan_px)))
+    pad = 2 * k + 2
+    lab, _ = ndimage.label(hole)
+    for sl in ndimage.find_objects(lab):
+        if sl is None:
+            continue
+        sl = tuple(slice(max(0, s.start - pad), min(hole.shape[a], s.stop + pad))
+                   for a, s in enumerate(sl))
+        h = hole[sl]
+        h = h | ndimage.binary_closing(h, iterations=k)
+        shut = ndimage.binary_fill_holes(h) & ~h
+        if shut.any():
+            il, n = ndimage.label(shut)
+            area = ndimage.sum(shut, il, np.arange(1, n + 1)) * scan_px * scan_px
+            h = h | np.isin(il, 1 + np.flatnonzero(area <= ISLAND))
+        hole[sl] |= h
+    if not cloned:
+        return fill(out, hole, np.random.default_rng(seed))
+    # The marks with a chosen source go last, in the order they are in, each
+    # copied from where it was told and healed to its edge (`clone`): what
+    # the automatic did not get right is what they are for, so they are not
+    # a place the automatic may copy from either.
+    bad = np.zeros((H, W), bool)
+    for m, _dx, _dy in cloned.values():
+        bad |= m
+    out = fill(out, hole & ~bad, np.random.default_rng(seed), bad)
+    for m, dx, dy in cloned.values():
+        clone(out, m, int(round(dy)), int(round(dx)))
+    return out
+
+
+def clone(img, h, dy, dx):
+    """`img` under `h` copied from `(dy, dx)` away and healed to the edge
+    round it (`_heal`), in place: the clone stamp with a source a person
+    chose. The part of `h` whose source is off the picture is left."""
+    H, W = img.shape[:2]
+    ys, xs = np.nonzero(h)
+    keep = (ys + dy >= 0) & (ys + dy < H) & (xs + dx >= 0) & (xs + dx < W)
+    if not keep.any():
+        return
+    ys, xs = ys[keep], xs[keep]
+    pad = 6
+    y0, y1 = max(0, ys.min() - pad), min(H, ys.max() + pad + 1)
+    x0, x1 = max(0, xs.min() - pad), min(W, xs.max() + pad + 1)
+    sub = img[y0:y1, x0:x1]
+    hh = np.zeros(sub.shape[:2], bool)
+    hh[ys - y0, xs - x0] = True
+    ey, ex = np.nonzero(_edge(hh))
+    ey_s = np.clip(ey + y0 + dy, 0, H - 1)
+    ex_s = np.clip(ex + x0 + dx, 0, W - 1)
+    hy, hx = np.nonzero(hh)
+    patch = img[hy + y0 + dy, hx + x0 + dx].copy()
+    sub[hy, hx] = _heal(sub, hh, patch, hy, hx, img[ey_s, ex_s],
+                        (~hh).astype(np.float32))
 
 
 def clean_mosaic(mos, pts, seed=0):
@@ -128,7 +272,7 @@ def clean_mosaic(mos, pts, seed=0):
     new array, or `mos` itself when there is nothing to do."""
     H, W = mos.shape
     H2, W2 = H - H % 2, W - W % 2
-    pq = [((x - 0.5) / 2, (y - 0.5) / 2, r) for x, y, r in pts]
+    pq = [((p[0] - 0.5) / 2, (p[1] - 0.5) / 2) + tuple(p[2:]) for p in pts]
     blocks = [(dy, dx) for dy in (0, 1) for dx in (0, 1)]
     Q = np.stack([mos[dy:H2:2, dx:W2:2] for dy, dx in blocks], -1)
     C = clean(Q, pq, 2.0, seed)
@@ -140,9 +284,133 @@ def clean_mosaic(mos, pts, seed=0):
     return out
 
 
-def _speck(img, hole, x, y, k, anyway):
+LONG = 2.5      # a grown speck this many times longer than wide is a hair
+DAB_KEEP = 90   # %: of a grown speck inside the dab made from it
+
+
+def migrate(img, x, y, r, scan_px):
+    """An old mark -- a point grown into the speck under it -- as the brush
+    would paint it: what `clean` would take out for it, measured once on
+    `img` and written down. Image pixels in, image pixels out.
+
+    Returns one of
+      ("dab", x, y, r)       a round speck: the disc round what was grown;
+      ("stroke", path, r)    a hair: its middle line, and half its width;
+      ("soft", x, y, r)      a soft disc that `clean` divides out, not fills:
+                             a dab marked `soft`, so it still is (`samples`).
+
+    **Measured, not guessed from the mark**: a point without a size meant
+    *whatever speck is under here*, and only the picture says how big that
+    was. With a size it was that disc and the speck under it up to
+    `SIZED_REACH` radii, so the same rule takes both."""
+    H, W = img.shape[:2]
+    hole = np.zeros((H, W), bool)
+    if r:
+        rr = max(1.0, r / scan_px)
+        y0, y1 = max(0, int(y - rr - 1)), min(H, int(y + rr + 2))
+        x0, x1 = max(0, int(x - rr - 1)), min(W, int(x + rr + 2))
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        hole[y0:y1, x0:x1] |= (xx - x) ** 2 + (yy - y) ** 2 <= rr * rr
+        _speck(img, hole, x, y, scan_px, False, SIZED_REACH * rr)
+    elif not _speck(img, hole, x, y, scan_px, False):
+        probe = img.copy()
+        if _blur(probe, x, y, scan_px):
+            # what the division moved by more than half a percent: its
+            # gain is feathered and resampled, so it is nowhere exactly 1
+            d = (np.abs(probe - img) / np.maximum(img, 1e-4)).max(axis=2) > 0.005
+            ys, xs = np.nonzero(d)
+            if len(ys):
+                # kept at the click: `clean` looks for the disc from there
+                # again, and from the disc's middle it can find another
+                rad = np.sqrt(((ys - y) ** 2 + (xs - x) ** 2).max()) + 1
+                return ("soft", float(x), float(y), float(rad))
+            return ("soft", float(x), float(y), 5.0 / scan_px)
+        _speck(img, hole, x, y, scan_px, True)
+    ys, xs = np.nonzero(hole)
+    if not len(ys):
+        return ("dab", float(x), float(y), max(1.0, 5.0 / scan_px))
+    pts = np.stack([xs, ys], 1).astype(np.float64) + 0.0
+    c = pts.mean(0)
+    w, v = np.linalg.eigh(np.cov((pts - c).T) + 1e-9 * np.eye(2))
+    axis, across = v[:, 1], v[:, 0]
+    if np.sqrt(w[1] / max(w[0], 1e-9)) < LONG:
+        # round the speck's body, not its furthest pixel: a disc out to
+        # the one stray pixel grown along a branch took the branch, and
+        # copied it into the sky (#19 on DSC_0238)
+        rad = np.percentile(np.sqrt(((pts - c) ** 2).sum(1)), DAB_KEEP) + 1.0
+        return ("dab", float(c[0]), float(c[1]), float(rad))
+    # a hair: its middle line, a point every few pixels along it, and the
+    # band wide enough to take every pixel that was grown
+    t = (pts - c) @ axis
+    u = (pts - c) @ across
+    step = max(2.0, np.sqrt(w[0]) * 2)
+    edges = np.arange(t.min(), t.max() + step, step)
+    path, half = [], 0.5
+    for lo in edges:
+        sel = (t >= lo) & (t < lo + step)
+        if sel.any():
+            mid = u[sel].mean()
+            half = max(half, np.abs(u[sel] - mid).max() + 0.5)
+            p = c + axis * t[sel].mean() + across * mid
+            path.append((float(p[0]), float(p[1])))
+    if len(path) < 2:
+        rad = np.sqrt(((pts - c) ** 2).sum(1).max()) + 0.5
+        return ("dab", float(c[0]), float(c[1]), float(rad))
+    # the ends are the ends of the hair, not the middles of the last bins
+    path[0] = tuple(c + axis * t.min() + across * u[t < t.min() + step].mean())
+    path[-1] = tuple(c + axis * t.max() + across * u[t > t.max() - step].mean())
+    return ("stroke", [(float(a), float(b)) for a, b in path], float(half))
+
+
+def chains(pts):
+    """Old marks drawn as a chain of discs along one hair, each chain in
+    the order it runs: lists of indices into `pts`, (x, y, r) in scan
+    pixels. Two discs are linked when they touch. Before the brush a hair
+    was marked that way -- 12 discs along the one on DSC_0427 -- and made
+    brush marks one by one it would stay a chain of dabs, where a person
+    now paints one stroke."""
+    n = len(pts)
+    seen, out = set(), []
+    for s in range(n):
+        if s in seen:
+            continue
+        group, todo = [], [s]
+        seen.add(s)
+        while todo:
+            i = todo.pop()
+            group.append(i)
+            for j in range(n):
+                if j not in seen and math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]) \
+                        <= pts[i][2] + pts[j][2]:
+                    seen.add(j)
+                    todo.append(j)
+        if len(group) < 2:
+            continue
+        # in order along it: from the disc furthest from the middle, then
+        # always the nearest one not yet taken
+        cx = sum(pts[i][0] for i in group) / len(group)
+        cy = sum(pts[i][1] for i in group) / len(group)
+        at = max(group, key=lambda i: math.hypot(pts[i][0] - cx, pts[i][1] - cy))
+        order, left = [at], set(group) - {at}
+        while left:
+            at = min(left, key=lambda i: math.hypot(pts[i][0] - pts[order[-1]][0],
+                                                    pts[i][1] - pts[order[-1]][1]))
+            order.append(at)
+            left.remove(at)
+        out.append(order)
+    return out
+
+
+def _speck(img, hole, x, y, k, anyway, reach=None):
     """Grow the speck under (x, y) into `hole`; a disc if `anyway` and
-    none is found. True if something went into `hole`."""
+    none is found. True if something went into `hole`.
+
+    `reach` (image px) keeps it that close to the mark. **A sized mark
+    needs it**: a hair is marked as a chain of discs, and where it crosses
+    a line of the scene the line can stand out more than the hair -- on
+    DSC_0427 of carrete_4 a white hair over a dark wire, and the two marks
+    on the crossing grew as dark specks 96 px along the wire, which the
+    fill then wiped out. Kept within two of the mark's radii they take 24."""
     H, W = img.shape[:2]
     half = max(4, int(math.ceil(WINDOW / k)))
     cx, cy = int(round(x)), int(round(y))
@@ -195,6 +463,8 @@ def _speck(img, hole, x, y, k, anyway):
         gs = 1.4826 * np.median(np.abs(g - np.median(g))) + 1e-6
         grown, n = ndimage.label(g > max(GROW * g[sy, sx], GROW_K * gs))
         speck = grown == grown[sy, sx]
+        if reach is not None:
+            speck &= r2 <= reach * reach
         if speck.sum() * k * k > AREA:
             if not anyway:
                 return False
@@ -262,7 +532,7 @@ def _edge(h):
     return ndimage.binary_dilation(h) & ~h
 
 
-def _heal(sub, h, patch, ys, xs, patch_edge):
+def _heal(sub, h, patch, ys, xs, patch_edge, valid):
     """The copied patch, its level bent to meet the hole's edge.
 
     **The healing brush.** A patch from beside the hole carries the right
@@ -279,9 +549,15 @@ def _heal(sub, h, patch, ys, xs, patch_edge):
     # this does not, and it was half the time of cleaning a frame
     y0, x0 = max(0, ys.min() - 4), max(0, xs.min() - 4)
     box = (slice(y0, ys.max() + 5), slice(x0, xs.max() + 5))
+    # only the edge that is picture: beside a piece of a hole not yet
+    # filled (`_fill_pieces`) the edge is still the speck
     edge = _edge(h)
     ey, ex = np.nonzero(edge)
-    full_edge = sub[ey, ex] - patch_edge
+    on = valid[ey, ex] > 0
+    full_edge = (sub[ey, ex] - patch_edge)[on]
+    ey, ex = ey[on], ex[on]
+    edge = np.zeros_like(edge)
+    edge[ey, ex] = True
     sub, h, edge = sub[box], h[box], edge[box]
     ys, xs = ys - y0, xs - x0
     D = np.zeros(sub.shape, np.float64)
@@ -341,10 +617,75 @@ def _copy(sub, h, valid):
     i = int(np.argmin(np.where(ok, ssd, np.inf)))
     dy, dx = int(oy.flat[i]), int(ox.flat[i])
     ey, ex = np.nonzero(_edge(h))
-    return _heal(sub, h, sub[ys + dy, xs + dx], ys, xs, sub[ey + dy, ex + dx])
+    return _heal(sub, h, sub[ys + dy, xs + dx], ys, xs, sub[ey + dy, ex + dx],
+                 valid)
 
 
-def fill(img, hole, rng):
+PIECE = 32           # px: a hole longer than this is filled in pieces this size
+
+
+def _pieces(h):
+    """The hole cut on a grid of `PIECE`, each cell's part of it a piece;
+    the hole itself when it fits in one."""
+    ys, xs = np.nonzero(h)
+    if max(np.ptp(ys), np.ptp(xs)) < PIECE:
+        return [h]
+    # **On the hole's own grid**, from its top left corner, not the
+    # window's: the window is the hole plus whatever room the picture
+    # round it allows, so the same hole cut from another crop -- the
+    # window's live view cleans only round what changed -- was cut in
+    # other pieces and filled differently, up to 57 levels on DSC_0238
+    cy = (np.arange(h.shape[0]) - ys.min()) // PIECE
+    cx = (np.arange(h.shape[1]) - xs.min()) // PIECE
+    cell = cy[:, None] * (h.shape[1] // PIECE + 2) + cx[None, :]
+    out = []
+    for c in np.unique(cell[h]):
+        lab, n = ndimage.label(h & (cell == c))
+        out += [lab == j for j in range(1, n + 1)]
+    return out
+
+
+def _fill_pieces(sub, h, valid):
+    """`_copy` piece by piece (`_pieces`), in place. None when all of it
+    went in; else what is left, for the fill that needs no patch."""
+    pieces = _pieces(h)
+    valid = valid.copy()
+    # each piece's box and a pixel round it, which holds its whole edge:
+    # taken over the hole's window, choosing the next piece dilated that
+    # window once per piece left per piece filled, and a dab of 120 px
+    # radius (58 pieces) took 39 s, 35 of them here
+    H, W = h.shape
+    boxes = []
+    for p in pieces:
+        ys, xs = np.nonzero(p)
+        boxes.append((slice(max(0, ys.min() - 1), min(H, ys.max() + 2)),
+                      slice(max(0, xs.min() - 1), min(W, xs.max() + 2))))
+    while pieces:
+        def edge_on(j):
+            e = _edge(pieces[j][boxes[j]])
+            return valid[boxes[j]][e].mean() if e.any() else 0.0
+        k = max(range(len(pieces)), key=edge_on)
+        p = pieces.pop(k)
+        boxes.pop(k)
+        # looked for round the piece, as a hole of its size is (`fill`):
+        # over the whole hole's window each piece cost an FFT of it, and
+        # the hair on DSC_0427 went from 3.6 s to 13.8 s
+        ys, xs = np.nonzero(p)
+        pad = int(max(24, COPY_MIN, COPY_REACH * (max(np.ptp(ys), np.ptp(xs)) + 1)) + 6)
+        win = (slice(max(0, ys.min() - pad), ys.max() + pad + 1),
+               slice(max(0, xs.min() - pad), xs.max() + pad + 1))
+        copied = _copy(sub[win], p[win], valid[win])
+        if copied is None:
+            left = p.copy()
+            for q in pieces:
+                left |= q
+            return left
+        sub[win][p[win]] = copied
+        valid[p] = 1.0
+    return None
+
+
+def fill(img, hole, rng, bad=None):
     """The best-matching neighbouring patch copied in (`_copy`); where
     there is none, normalised convolution from the surroundings, then
     grain from beside the hole.
@@ -369,16 +710,25 @@ def fill(img, hole, rng):
                    for a, s in enumerate(sl))
         h = lab[sl] == i
         sub = out[sl]
-        valid = (~hole[sl]).astype(np.float32)
+        valid = (~hole[sl] if bad is None else ~(hole[sl] | bad[sl])).astype(np.float32)
         # One patch, healed (`_copy`, `_heal`). Tried and dropped on
         # DSC_0238: the hole filled in layers from its edge (Criminisi),
         # which drew dark flecks of the trees into a light ledge (#8); and
         # each hole pixel from the locally best of eight shifts, which drew
         # the branch into the sky beside it (#19) and spotted #89.
-        copied = _copy(sub, h, valid)
-        if copied is not None:
-            sub[h] = copied
+        #
+        # **A long hole goes in pieces** (`PIECE`), each its own patch, the
+        # piece with most of its ring on the picture first, and each filled
+        # piece then part of the picture for the next. One shift continues
+        # one line of the scene: a hair on DSC_0427 of carrete_4, 167 px
+        # long, crosses a sloping wire and then a pair of wires at another
+        # slope, and the one patch that continued the first smudged the
+        # pair where the hair's tip curls over them.
+        left = _fill_pieces(sub, h, valid)
+        if left is None:
             continue
+        valid = np.maximum(valid, (h & ~left).astype(np.float32))
+        h = left
         est = sub.copy()
         done = ~h
         for sigma in (1, 2, 4, 8, 16, 32):

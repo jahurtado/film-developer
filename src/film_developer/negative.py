@@ -139,11 +139,11 @@ def _job(job):
 
 
 def write_roll(roll_dir, doc, out_dir, taste, crop, workers, progress=None,
-               stats=None, pictures=True, raws=True, compress=True):
+               stats=None, pictures=True, raws=True, compress=True, only=None):
     """Every frame of the document as a negative: the picture, the raw or
     both. `stats` is the roll's measurement, for its matrix.
     Returns {file name: evidence}."""
-    frames = develop.frames_of(roll_dir, doc)
+    frames = develop.frames_of(roll_dir, doc, only)
     if not frames or not (pictures or raws):
         return {}
     matrix = (stats or {}).get("matrix")
@@ -163,11 +163,11 @@ def write_roll(roll_dir, doc, out_dir, taste, crop, workers, progress=None,
     return dict(develop._run(_job, jobs, workers, progress))
 
 
-def record(out_dir, taste, crop, results):
+def record(out_dir, taste, crop, results, only=None):
     """`negatives.json` beside the files: what was cut and how."""
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    develop.sweep(out_dir, "negatives.json", results)
+    results = develop.kept(out_dir, "negatives.json", results, only)
     (out_dir / "negatives.json").write_text(json.dumps(
         {"settings": {"format": taste.get("format", "jpeg"), "crop": crop,
                       "crop_inset": develop.crop_inset(taste)},
