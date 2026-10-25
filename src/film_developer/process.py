@@ -4,6 +4,7 @@
     film-developer process ROLL_DIR --no-raws --format tiff16
     film-developer process ROLL_DIR --negatives      # the untouched crops too
     film-developer process A B C                     # several rolls, one after another
+    film-developer process ROLL_DIR --only DSC_0427  # one photo, the rest left as they are
 
 What the `⌘R` sheet asks is asked here as flags, with the sheet's
 defaults: developed pictures and positive DNGs yes, the negatives no, and
@@ -15,7 +16,7 @@ window reads them from there too -- and every output is made from them.
 `develop` and `apply` each measure the roll for themselves and keep
 nothing; they stay, for a run of one of the two.
 
-How the pictures are developed is the roll's setting (`⌘K` in the window,
+How the pictures are developed is the roll's setting (`⌘L` in the window,
 `develop --warmth ...` or `roll` here), not a flag of this.
 """
 
@@ -50,6 +51,10 @@ def add_args(ap):
     ap.add_argument("--numbered", dest="numbered", action="store_true",
                     default=None, help="shot number in front of every name (kept)")
     ap.add_argument("--not-numbered", dest="numbered", action="store_false")
+    ap.add_argument("--only", action="append", metavar="SCAN",
+                    help="this scan alone (its file name, with or without "
+                         "the extension; again for more). The roll's other "
+                         "files are left as they are and stay in the record")
     ap.add_argument("--workers", type=int, metavar="N",
                     help="processes (default: the machine's cores, up to 8)")
 
@@ -107,21 +112,35 @@ def one(roll, args, workers):
     if stats is None:
         print("  the roll could not be measured", file=sys.stderr)
         return 1
+    only = None
+    if args.only:
+        by_stem = {pathlib.Path(n).stem: n for n in doc["items"]}
+        only = [n if n in doc["items"] else by_stem.get(n) for n in args.only]
+        if None in only:
+            missing = [a for a, n in zip(args.only, only) if n is None]
+            print(f"  no such scan in the roll: {', '.join(missing)}",
+                  file=sys.stderr)
+            return 1
+    moved = develop.migrate_roll(roll, doc)
+    if moved:
+        document.save(doc, roll)
+        print(f"  {moved} dust marks from before the brush made brush marks "
+              f"(the document as it was: frames.before-brush.json)")
     said = []
     if args.positives:
         out_dir = roll / "developed"
         results, ev = develop.develop_roll(roll, doc, out_dir, taste, workers,
-                                           _tick("developing"), stats)
+                                           _tick("developing"), stats, only)
         print()
-        develop.record(out_dir, taste, ev, results)
+        develop.record(out_dir, taste, ev, results, only)
         said.append(f"{len(results)} pictures in developed/")
     if args.raws:
         settings = positive.settings_of(doc)
         out_dir = roll / "frames"
         results, ev = positive.write_roll(roll, doc, out_dir, settings, workers,
-                                          _tick("raw DNGs"), stats)
+                                          _tick("raw DNGs"), stats, only)
         print()
-        positive.record(out_dir, settings, ev, results)
+        positive.record(out_dir, settings, ev, results, only)
         said.append(f"{len(results)} raw DNGs in frames/")
     if args.negatives and (args.positives or args.raws):
         out_dir = roll / negative.FOLDER
@@ -129,9 +148,9 @@ def one(roll, args, workers):
         results = negative.write_roll(
             roll, doc, out_dir, taste, crop, workers, _tick("negatives"),
             stats, pictures=args.positives, raws=args.raws,
-            compress=bool(app.get("compress", True)))
+            compress=bool(app.get("compress", True)), only=only)
         print()
-        negative.record(out_dir, taste, crop, results)
+        negative.record(out_dir, taste, crop, results, only)
         said.append(f"{len(results)} negatives in {negative.FOLDER}/")
     print("  " + ("; ".join(said) if said else "nothing asked for"))
     return 0

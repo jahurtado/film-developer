@@ -492,12 +492,12 @@ def _job(job):
 
 
 def write_roll(roll_dir, doc, out_dir, settings, workers, progress=None,
-               stats=None):
+               stats=None, only=None):
     """Every frame of the document as a positive DNG. The roll's statistics
     (base colour, balance) unless given, then each frame.
     Returns ({file name: evidence}, roll evidence)."""
     roll_dir = pathlib.Path(roll_dir)
-    frames = develop.frames_of(roll_dir, doc)
+    frames = develop.frames_of(roll_dir, doc, only)
     if not frames:
         return {}, {}
     gamma = settings["gamma"]
@@ -534,10 +534,10 @@ def write_roll(roll_dir, doc, out_dir, settings, workers, progress=None,
     return results, roll_ev
 
 
-def record(out_dir, settings, roll_ev, results):
+def record(out_dir, settings, roll_ev, results, only=None):
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    develop.sweep(out_dir, "positives.json", results)
+    results = develop.kept(out_dir, "positives.json", results, only)
     (out_dir / "positives.json").write_text(json.dumps(
         {"settings": settings, "roll": roll_ev, "frames": results}, indent=1) + "\n")
 

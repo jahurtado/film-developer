@@ -10,10 +10,11 @@ undo it, and turns pink on the canvas and in the list, because `#ff6ac1` means
 """
 
 import copy
+import json
 import math
 import os
 import pathlib
-import webbrowser
+import time
 
 import numpy as np
 from PySide6.QtCore import (QEvent, QPoint, QPointF, QRectF, QSize, Qt, QThread,
@@ -168,8 +169,6 @@ class Canvas(QWidget):
         self.view = None                  # None, "raw", "base", "result" or "developed"
         self.crop_pct = 0.0               # drawn on the frame, live
         self.label = ""                   # which way of looking, on the canvas
-        # `hold ⇧S`: the dust marks, in scan pixels and on the cut picture
-        self.specks_on, self.specks_scan, self.specks_cut = False, [], []
         self.zoom, self.offset = 1.0, QPoint(0, 0)
         self._fitted_turn = 0             # the view turn the zoom was fitted to
         # `⇧B`: a box dragged over unexposed film, in scan pixels
@@ -199,8 +198,19 @@ class Canvas(QWidget):
         self.dust_hover = None            # the pointer, over the dust frame
         self.dust_named = lambda pos: None  # the window's: the mark under it, named
         self.dust_tip = None              # what that said, drawn by the pointer
-        self.dust_brush = None            # picture px, or None: found under the click
+        self.dust_brush = None            # picture px, or None: dust.STROKE_R
         self.dust_marks = []              # (x, y) on the full-size frame shown
+        self.dust_stroked = lambda pts: None  # the window's hook for a painted stroke
+        self._stroke = None               # the stroke being painted, screen points
+        # the window's, for ⌘ + drag on a mark: pressed, moved, let go
+        self.dust_clone_press = lambda pos: None
+        self.dust_clone_drag = lambda pos: None
+        self.dust_clone_release = lambda pos: None
+        self._cloning = False
+        # a picture laid over the frame, in picture px: what a mark would
+        # look like cloned from under the pointer, while ⌘ is held
+        self.dust_overlay = None          # (QPixmap, x, y) or None
+        self.dust_source = None           # ((x, y) of the mark, (x, y) of its source)
         self.dragged = lambda scope: None  # the window's hook for a widened drag
         # Where the raw clipped, blinking over the scan as it came. The
         # window answers for a pixmap, so the marks go only on the picture
@@ -399,6 +409,18 @@ class Canvas(QWidget):
                 self.picked(i)
                 self.update()
                 return
+        if (self.view == "dust" and e.button() == Qt.LeftButton
+                and e.modifiers() & Qt.ControlModifier):
+            # ⌘ + drag on a mark moves what it is cloned from; ⌘ + click,
+            # back to the automatic fill
+            self._cloning = True
+            return self.dust_clone_press(e.position())
+        if (self.view == "dust" and e.button() == Qt.LeftButton
+                and not e.modifiers() & Qt.AltModifier):
+            # **In the dust a drag paints** (a scratch, a hair) and ⌥ + drag
+            # moves about; a press that does not move is still a click
+            self._stroke = [e.position()]
+            return
         self._pan = self.unturn(e.position()).toPoint() - self.offset
         self._pan_at = e.position() - self.cut_pan      # for the fitted views
         self._pan_from = e.position().toPoint()
@@ -408,6 +430,17 @@ class Canvas(QWidget):
             x, y = self.to_scan(e.position())
             self.base_box = (*self._base_from, x, y)
             return self.update()
+        if self.view == "dust" and self._stroke is not None:
+            p = e.position()
+            if (p - self._stroke[-1]).manhattanLength() >= 2:
+                self._stroke.append(p)
+                r = self._dust_cursor_r() + 4
+                a, b = self._stroke[-2], p
+                self.update(int(min(a.x(), b.x()) - r), int(min(a.y(), b.y()) - r),
+                            int(abs(a.x() - b.x()) + 2 * r) + 1,
+                            int(abs(a.y() - b.y()) + 2 * r) + 1)
+        if self.view == "dust" and self._cloning:
+            self.dust_clone_drag(e.position())
         if self.view == "dust":
             # only the ring under the pointer, where it was and where it is:
             # repainting a 20 MP frame per pixel of movement was felt
@@ -438,6 +471,17 @@ class Canvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, e):
+        if self._cloning:
+            self._cloning = False
+            return self.dust_clone_release(e.position())
+        if self._stroke is not None:
+            pts, self._stroke = self._stroke, None
+            span = max((p - pts[0]).manhattanLength() for p in pts)
+            if span < 4:
+                self.dust_clicked(e.position())
+            else:
+                self.dust_stroked(pts)
+            return self.update()
         if self.picking_base and self._base_from is not None:
             self._base_from = None
             box = self.base_box
@@ -480,11 +524,14 @@ class Canvas(QWidget):
             self.update()
         super().leaveEvent(e)
 
-    def _dust_cursor_r(self):
-        """The ring that follows the pointer, in screen px: the size a click
-        will give the mark, or the plain ring of one found under the click."""
-        k = self.dust_scale()[0]
-        return self.dust_brush * k if self.dust_brush else max(11.0, 8 * k)
+    def _dust_cursor_r(self, stroke=False):
+        """The ring that follows the pointer, in screen px: the brush a
+        click dabs and a drag paints with (`dust.STROKE_R` when no size was
+        set). `stroke` is kept for the callers; the two are one brush."""
+        from . import dust
+        # never under 3 screen px: a 4 px brush over the whole frame is a
+        # fifth of a pixel, and a ring that cannot be seen is no pointer
+        return max(3.0, (self.dust_brush or dust.STROKE_R) * self.dust_scale()[0])
 
     def _choose(self, pos):
         pos = self.unturn(pos)
@@ -497,6 +544,11 @@ class Canvas(QWidget):
                 return
 
     def mouseDoubleClickEvent(self, e):
+        # Not where a click places something: Qt sends the second click of
+        # two quick ones here instead of to the press, and two specks dabbed
+        # in a hurry fitted the frame instead of marking the second.
+        if self.mode or self.view == "dust" or self.picking_base:
+            return self.mousePressEvent(e)
         self.fit()
 
     def zoom_to(self, points, margin=1.25):
@@ -698,7 +750,6 @@ class Canvas(QWidget):
         q.setRenderHint(QPainter.SmoothPixmapTransform)
         if self.view == "developed":
             self._paint_developed(q, pm)
-            self._paint_specks(q, pm)
             return self._paint_label(q)
         if self.view == "dust":
             self._paint_dust(q, pm)
@@ -740,7 +791,6 @@ class Canvas(QWidget):
         for i, part in enumerate(self.parts):
             self._paint_part(q, i, part)
         self._paint_base_box(q)
-        self._paint_specks(q, pm)
         self._paint_label(q)
 
     def _paint_base_box(self, q):
@@ -788,26 +838,6 @@ class Canvas(QWidget):
         q.setBrush(Qt.NoBrush)
         q.setPen(QPen(QColor(PRIMARY)))
         q.drawText(box, Qt.AlignCenter, self.label)
-
-    def _paint_specks(self, q, pm):
-        """The dust marks, while `⇧S` is held: round the speck, not on it."""
-        if not self.specks_on:
-            return
-        if self.view == "developed":
-            k = min(self.width() / max(pm.width(), 1),
-                    self.height() / max(pm.height(), 1)) * 0.98 * self.cut_zoom
-            ox = (self.width() - pm.width() * k) / 2 + self.cut_pan.x()
-            oy = (self.height() - pm.height() * k) / 2 + self.cut_pan.y()
-            pts = [QPointF(ox + (x + 0.5) * k, oy + (y + 0.5) * k)
-                   for x, y in self.specks_cut]
-            r = max(9.0, 8 * k)
-        else:
-            pts = [self._screen(x, y) for x, y in self.specks_scan]
-            r = max(9.0, 8 * self.zoom / self.scale)
-        q.setPen(QPen(QColor(MANUAL), 2))
-        q.setBrush(Qt.NoBrush)
-        for p in pts:
-            q.drawEllipse(p, r, r)
 
     def _paint_waiting(self, q, text):
         """A line in the middle of an empty canvas, for work under way."""
@@ -955,6 +985,10 @@ class Canvas(QWidget):
         q.setRenderHint(QPainter.SmoothPixmapTransform, k < 1)
         q.drawPixmap(QRectF(o.x(), o.y(), pm.width() * k, pm.height() * k),
                      pm, QRectF(pm.rect()))
+        if self.dust_overlay is not None:
+            ov, ox, oy = self.dust_overlay
+            q.drawPixmap(QRectF(o.x() + ox * k, o.y() + oy * k,
+                                ov.width() * k, ov.height() * k), ov, QRectF(ov.rect()))
         q.setRenderHint(QPainter.SmoothPixmapTransform)
         q.setBrush(Qt.NoBrush)
         # round the speck, not on it: the mark must not hide what it marks.
@@ -963,9 +997,37 @@ class Canvas(QWidget):
         # A mark given a size is drawn at that size, just outside it: the
         # ring is then the edge of what will be filled. One without is
         # drawn round the speck, at a size that says nothing.
-        for x, y, style, focus, size in self.dust_marks:
+        # A mark cloned from a place a person chose: a thin line to a dashed
+        # ring there, in the colour of a reference -- what it borrows from.
+        lines = [(x, y, size, src) for x, y, style, focus, size, path, src
+                 in self.dust_marks if src is not None]
+        if self.dust_source is not None:
+            (mx, my), (sx, sy) = self.dust_source
+            lines.append((mx, my, self.dust_brush or 4.0, (sx, sy)))
+        for x, y, size, (sx, sy) in lines:
+            a = QPointF(o.x() + x * k, o.y() + y * k)
+            b = QPointF(o.x() + sx * k, o.y() + sy * k)
+            rr = max(3.0, (size or 4.0) * k)
+            q.setPen(QPen(QColor(REF), 1.5))
+            q.drawLine(a, b)
+            q.setPen(QPen(QColor(REF), 1.5, Qt.DashLine))
+            q.drawEllipse(b, rr, rr)
+        for x, y, style, focus, size, path, _src in self.dust_marks:
             r = size * k + 1.5 if size else max(11.0, 8 * k)
             colour = {"hand": MANUAL, "refused": GONE}.get(style, DETECTED)
+            if path:
+                # a stroke: the band that will be filled, see-through, so
+                # the scratch under it still shows
+                pts = [QPointF(o.x() + px * k, o.y() + py * k) for px, py in path]
+                band = QColor(colour)
+                band.setAlpha(150 if focus else 90)
+                q.setPen(QPen(band, max(6.0, 2 * size * k), Qt.SolidLine,
+                              Qt.RoundCap, Qt.RoundJoin))
+                if len(pts) == 1:
+                    q.drawPoint(pts[0])     # a dab: the round cap is its disc
+                else:
+                    q.drawPolyline(pts)
+                continue
             pen = QPen(QColor(colour), 3 if focus else 2)
             if style in ("proposed", "refused"):
                 pen.setStyle(Qt.DashLine)
@@ -974,6 +1036,12 @@ class Canvas(QWidget):
             q.drawEllipse(c, r, r)
             if focus:
                 q.drawEllipse(c, r + 5, r + 5)
+        if self._stroke is not None and len(self._stroke) > 1:
+            band = QColor(MANUAL)
+            band.setAlpha(110)
+            q.setPen(QPen(band, 2 * self._dust_cursor_r(stroke=True), Qt.SolidLine,
+                          Qt.RoundCap, Qt.RoundJoin))
+            q.drawPolyline(self._stroke)
         if self.dust_hover is not None:
             # dotted and shaded, the brush and not a mark; dark under light,
             # so it reads on a white sky and on a black wall alike
@@ -1217,104 +1285,99 @@ class Editor(QMainWindow):
         # Three ways of looking, on one key, because they are one question:
         # how far down the pipeline what you are looking at has come. The
         # sheet names them in that order and the read line says which is on.
-        ("VIEW", (("v ⇧V", "image view (raw/positive/developed), or back", None, "_cycle"),
+        # **One row per action that can be clicked**: two keys on one row
+        # leave the mouse no way to say which. Held keys and gestures, which
+        # are not clicked, can share one.
+        ("VIEW", (("n", "next", None, "_next"),
+                  ("p", "previous", None, "_prev"),
+                  ("v", "view: raw / positive / developed", None, "_cycle"),
+                  ("⇧V", "view, backwards", None, "_cycle_back"),
                   # Its name is the mode it takes you to, and `_say_space`
                   # rewrites it: out here it offers the preview, in the
-                  # preview it offers the way back. This is the text for the
-                  # state the window starts in.
-                  ("space", "preview mode", "part", "_cut"),
-                  ("f", "zoom to fit", None, "canvas.fit"),
-                  ("hold b", "show film base area", None, None),
-                  # the stand's light falloff the other way round while
-                  # held: off where it is applied, on where it is not
-                  ("hold l", "flip light falloff", None, None),
+                  # preview the way back. This is the text for the state the
+                  # window starts in.
+                  ("space", "preview", "part", "_cut"),
+                  ("f", "fit", None, "canvas.fit"),
                   # One row, because it is one thing asked of two keys and
                   # the sheet is read as a list of things you can do.
-                  ("hold 1 / 2", "preview frame a / b", "part", None),
-                  # Mirroring is a property of the roll and an axis of its
-                  # own, but it is a way of *looking*: it changes no
-                  # measurement and nothing that is written.
-                  ("m", "mirror images", None, "_mirror"),
+                  ("hold 1 / 2", "show frame a / b", "part", None),
                   # the develop's numbers for the frame in hand, under the
-                  # canvas, with a link that copies them
-                  ("i", "develop numbers", None, "_toggle_numbers"))),
-        ("NAVIGATION", (("n", "next", None, "_next"),
-                        ("p", "previous", None, "_prev"),
-                        # the list is the order the pictures were taken
-                        # in; dragging and the right button do the rest
-                        ("⌥↑ ⌥↓", "move in the list", None, None))),
-        ("EDIT", (("r", "rotate left", "part", "_turn_left"),
+                  # canvas, with a link that copies them: something to look
+                  # at, so with the other views
+                  ("i", "development details", None, "_toggle_numbers"))),
+        # **By area of the work, in its order**: the frames placed first,
+        # then the colour checked, then the dust, then what is written.
+        ("CROP", (("e", "edit crop frames", None, "_enter_mode"),
+                  ("r", "rotate left", "part", "_turn_left"),
                   ("⇧R", "rotate right", "part", "_turn_right"),
-                  ("⌘C", "copy cropping", "part", "_copy_frames"),
-                  ("⌘V", "paste cropping", "copied", "_paste_frames"),
-                  ("e", "edit crop frames", None, "_enter_mode"),
-                  # the frame at full size, to mark dust on by hand: the
-                  # ground truth a dust finder is measured against
-                  ("s", "mark dust", "part", "_enter_dust"),
-                  ("hold ⇧S", "show the dust marks", None, None),
-                  # this scan's own unexposed film, for a scan copied
-                  # under another light (`develop.own_base`)
-                  ("⇧B", "pick film base…", "part", "_pick_base"),
-                  ("del", "skip this scan", None, "_skip"))),
-        # **Analyse, not process.** Finding the frames and developing the
-        # pictures are different jobs on different things, and one word for
-        # both left `⌘R` and `⌘D` reading as the same act at two scales.
-        # The ellipsis says a key asks before it acts: both of these open the roll's sheet first.
-        ("PROCESS", (("⌘R", "Process images", None, "_process"),
-                     ("⌘D", "Re-analyze this image…", None, "_redetect"),
-                     ("⇧⌘D", "Re-analyze the roll…", None, "_redetect_roll"),
-                     # the stand's falloff, which the roll is developed
-                     # through: chosen or made here, nowhere else needed
-                     ("⌘L", "Light falloff…", None, "_light_falloff"),
-                     # the roll's taste by eye, with the frame in front
-                     # of you: one look for every frame (`look.py`)
-                     ("⌘K", "Develop look…", None, "_look"))),
+                  # **Not a way of looking**: the roll's mirror is in every
+                  # file written, and it orders the frames a and b
+                  ("m", "mirror roll", None, "_mirror"),
+                  ("⌘C", "copy crop", "part", "_copy_frames"),
+                  ("⌘V", "paste crop", "copied", "_paste_frames"),
+                  ("del", "skip scan", None, "_skip"))),
+        ("COLOUR", (("hold b", "show base", None, None),
+                    # this scan's own unexposed film, for a scan copied
+                    # under another light, or for the whole roll
+                    # (`develop.own_base`); `_say_base` rewrites it
+                    ("⇧B", "pick base…", "part", "_pick_base"),
+                    # the stand's light falloff the other way round while
+                    # held: off where it is applied, on where it is not
+                    ("hold l", "flip falloff", None, None),
+                    ("⇧⌘L", "falloff calibration…", None, "_light_falloff"))),
+        ("DUST", (("s", "edit dust marks", "part", "_enter_dust"),
+                  # the develop with the dust left in, as inside `s`
+                  ("hold c", "show original", None, None))),
+        ("PROCESS", (# the roll's taste by eye, one look for every frame
+                     ("⌘L", "edit roll look…", None, "_look"),
+                     # the same sheet; with ⇧ it starts on this scan
+                     ("⌘R", "process roll…", None, "_process"),
+                     ("⇧⌘R", "process scan…", None, "_process_scan"),
+                     # Work on the roll, as ⌘R is, so beside it; named
+                     # apart from it because finding the frames and
+                     # developing them are different jobs. The ellipsis
+                     # says the key asks before it acts.
+                     ("⌘D", "re-analyze scan…", None, "_redetect"),
+                     ("⇧⌘D", "re-analyze roll…", None, "_redetect_roll"))),
     )
 
     MODE_SHEET = (
-        ("MOVE", (("arrows", "the chosen corner", None, None),
-                  ("⇧ arrows", "this frame", None, None),
-                  ("⌥ arrows", "every frame", "two", None))),
-        ("CORNER", (("⇥", "the next one, round and on", None, "_tab_on"),
-                    ("⇧⇥", "the one before", None, "_tab_back"),
-                    ("drag", "place it, on either frame", None, None),
-                    ("⇧ drag", "slide this frame", None, None))),
-        ("FRAME", (("+", "add one", None, "_add_part"),
-                   ("-", "drop this one", "part", "_drop_part"),
-                   )),
-        ("LOOK", (("z", "in on the corner", "part", "canvas.zoom_corner"),
-                  ("⇧Z", "out to the frame", "part", "canvas.zoom_frame"),
-                  ("f", "the whole scan", None, "canvas.fit"))),
-        ("TURN", ((", .", "turn the film", "part", None),
-                  ("⇧ , .", "a tenth of that", "part", None),
-                  ("⇧K", "back to what was measured", "manual", "_reset"))),
-        ("", (("↩", "apply", None, "_apply_mode"),
+        ("MOVE", (("arrows", "corner", None, None),
+                  ("⇧ arrows", "frame", None, None),
+                  ("⌥ arrows", "all frames", "two", None),
+                  ("⇧ drag", "move frame", None, None))),
+        # A drag on a corner is not here: the corners are drawn, and taking
+        # one is what a pointer does. The sheet is for what cannot be seen.
+        ("FRAME", (("⇥", "next corner", None, "_tab_on"),
+                   ("⇧⇥", "previous corner", None, "_tab_back"),
+                   ("+", "add frame", None, "_add_part"),
+                   ("-", "remove frame", "part", "_drop_part"),
+                   ("⌫", "reset", "manual", "_reset"))),
+        ("TURN", ((", .", "rotate", "part", None),
+                  ("⇧ , .", "rotate fine", "part", None))),
+        ("LOOK", (("z", "zoom to corner", "part", "canvas.zoom_corner"),
+                  ("⇧Z", "zoom to frame", "part", "canvas.zoom_frame"),
+                  ("f", "fit", None, "canvas.fit"))),
+        ("", (("↩ e", "apply", None, "_apply_mode"),
               ("esc", "cancel", None, "_cancel_mode"))),
     )
 
     # Marking dust. **Every click is saved as it is made**, so there is no
     # cancel: an afternoon of marks is not something one key should be able
     # to throw away, and a wrong mark is taken back by clicking it.
-    # Three columns of four. **What a person does** first -- marking is the
-    # job, and it is what works; **looking** second; and **the finder**
-    # last and called experimental, because on DSC_0238 it found a quarter
-    # of what was marked and most of what it put forward was not dust.
-    # One `click` row: on a found mark a click decides it, which is said in
-    # the same line rather than as a second `click` in another column.
+    # A click and a drag paint, and are not here: the pointer is the brush's
+    # ring. Clicking a mark is, because nothing on screen says it removes it.
     DUST_SHEET = (
-        ("MARK", (("click", "mark or unmark a speck", None, None),
-                  ("⇧ wheel", "its size, or the next one's", None, None),
-                  ("drag", "move about", None, None),
-                  ("esc", "done", None, "_leave_dust"))),
-        ("LOOK", (("z", "100 % / the whole frame", None, "_dust_zoom"),
-                  ("n p", "next / previous patch, at 100 %", None, "_dust_next"),
-                  ("f", "the whole frame", None, "_dust_fit"),
-                  ("hold c", "with the dust taken out", None, None))),
-        ("FIND (EXPERIMENTAL)", (
-                  ("d", "find dust", None, "_dust_find"),
-                  (". ,", "next / previous one found", None, None),
-                  ("a x", "dust / not dust, and on · ⇧ for all", None, None),
-                  ("del", "remove found, keep accepted", None, None))),
+        ("MARK", (("click", "remove mark", None, None),
+                  ("⇧ wheel", "brush size", None, None),
+                  ("⌘ drag", "set clone source", None, None),
+                  ("⌘ click", "reset clone source", None, None))),
+        ("LOOK", (("z", "100 %", None, "_dust_zoom"),
+                  ("f", "fit", None, "_dust_fit"),
+                  ("⌥ drag", "pan", None, None),
+                  ("v", "show marks", None, "_dust_see"),
+                  ("hold c", "show original", None, None))),
+        ("", (("esc", "done", None, "_leave_dust"),)),
     )
 
     def __init__(self, roll, doc, identity=("", "")):
@@ -1342,17 +1405,19 @@ class Editor(QMainWindow):
         # and only the second has to be redone when the taste changes.
         self.dev_plain, self.dev_ev = {}, {}   # the scan developed, whole
         self.dev_worker, self.dev_want = None, None
-        # `hold l`: the light falloff the other way round, and the pictures
-        # drawn that way, kept apart from the real ones (`_hold_light`)
-        self.flat_off, self._alt = False, None
+        # `hold l` and `hold c`: the light falloff the other way round, or
+        # the dust left in, and the pictures drawn that way, kept apart from
+        # the real ones (`_hold_other`). One at a time.
+        self.held_other, self._sets = None, {}
         self.prefetch = None               # the roll developing itself
         self._threads = []                 # runs kept alive until they end
         self.mode = False
         self.before = None                 # the item as it was on entering
         self.dusting = False               # marking dust (`s`)
-        self.dust_finder = None            # `d` in there
         self.dust = None                   # what that mode is marking, and how
         self.dust_worker = None            # the frame developing at full size
+        self.dust_kept = {}                # its pictures, by what they depend on
+        self.dust_kept_clean = {}          # and with the dust out, as left
         self.undo, self.redo = [], []
         self.setWindowTitle(f"film-developer — {roll.name}")
         self._build()
@@ -1401,6 +1466,10 @@ class Editor(QMainWindow):
         self.canvas.turned = self._turned
         self.canvas.picked = self._picked
         self.canvas.dust_clicked = self._dust_click
+        self.canvas.dust_stroked = self._dust_stroke
+        self.canvas.dust_clone_press = self._dust_clone_press
+        self.canvas.dust_clone_drag = self._dust_clone_drag
+        self.canvas.dust_clone_release = self._dust_clone_release
         self.canvas.dust_resized = self._dust_resize
         self.canvas.dust_named = self._dust_named
         self.canvas.clip_for = self._clip_for
@@ -1489,24 +1558,17 @@ class Editor(QMainWindow):
         return w
 
     def _controls(self):
-        """The two knobs on how the scan is drawn, under the canvas.
+        """The crop margin of the final image, under the canvas.
 
         The window puts what you *read* above the canvas and what you
-        *operate* below it, and it puts the controls that change nothing in
-        the document first, with a caption that says so. These are the only
-        controls this window has, and they are all of that kind.
+        *operate* below it. The crop margin is the only control left here,
+        and its name says what it changes: the final image.
         """
         w = QWidget()
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 10, 0, 0)
         row.setSpacing(0)
-        cap2 = QLabel("WHAT COMES OUT")
-        cap2.setStyleSheet(
-            f"color: {SUB}; font-size: 9px; letter-spacing: 1.4px;")
-        row.addWidget(cap2)
-        row.addSpacing(14)
-
-        lab = QLabel("crop margin")
+        lab = QLabel("final image crop margin")
         lab.setStyleSheet(f"color: {COMMAND};")
         row.addWidget(lab)
         self.crop_box = QDoubleSpinBox()
@@ -1518,11 +1580,10 @@ class Editor(QMainWindow):
         self.crop_box.setValue(float(self.doc["roll"].get("develop", {}).get("crop", 0.0)))
         self.crop_box.setFixedWidth(92)
         self.crop_box.setToolTip(_tip(
-            "taken off every side of every frame when it is developed, as a "
-            "share of that side, or added if negative -- a share and not a "
-            "number of pixels, so it does not change the shape. It is a roll "
-            "setting and it touches the positives only: the raw DNGs are "
-            "written at the frame itself, inside it or around it"))
+            "cut from every side of every developed photo, as a percentage "
+            "of that side, so the shape stays the same. A negative value "
+            "adds a border. It applies to the whole roll, and not to the "
+            "raw DNGs"))
         self.crop_box.valueChanged.connect(self._set_crop)
         row.addWidget(self.crop_box)
         row.addSpacing(14)
@@ -1534,7 +1595,7 @@ class Editor(QMainWindow):
         return w
 
     def _numbers_panel(self):
-        """`i`: what the develop did to the frame in hand, as numbers, under
+        """`i`: the development details of the frame in hand, as numbers, under
         the controls -- the automatics apart from the taste, the window's
         develop beside the one `⌘R` wrote, and a link that copies it all.
 
@@ -1549,7 +1610,7 @@ class Editor(QMainWindow):
         lay.setSpacing(4)
         head = QHBoxLayout()
         head.setSpacing(0)
-        cap = QLabel("WHAT THE DEVELOP DID")
+        cap = QLabel("DEVELOPMENT DETAILS")
         cap.setStyleSheet(f"color: {SUB}; font-size: 9px; letter-spacing: 1.4px;")
         head.addWidget(cap)
         head.addSpacing(14)
@@ -1590,7 +1651,7 @@ class Editor(QMainWindow):
 
     def _copy_numbers(self):
         QApplication.clipboard().setText(self._numbers_text())
-        self.status.setText("the develop's numbers copied")
+        self.status.setText("development details copied")
 
     def _file_evidence(self):
         """What `⌘R` wrote last, from `developed/developed.json`, re-read
@@ -1736,17 +1797,15 @@ class Editor(QMainWindow):
             self.crop_says.setText("")
             return
         if not pct:
-            # Nothing said, because nothing is taken: the margin is zero and
-            # the caption over the row already says these controls are about
-            # what comes out. A line naming the frame at rest was a sentence
-            # that never changed and never meant anything.
+            # Nothing said, because nothing is cut: a line about a zero
+            # margin never changed and never meant anything.
             self.crop_says.setText("")
         else:
             dx, dy = p["size"][0] * pct / 100.0, p["size"][1] * pct / 100.0
             self.crop_says.setText(
-                f"{'off' if pct > 0 else 'onto'} every side: "
-                f"{abs(dx):.0f} px across, {abs(dy):.0f} px down "
-                f"-- the positives only")
+                f"{abs(dx):.0f} px {'cut from' if pct > 0 else 'added to'} "
+                f"left and right, {abs(dy):.0f} px top and bottom, "
+                f"developed photos only")
 
     def _bar(self, name, top):
         f = QFrame()
@@ -1845,6 +1904,9 @@ class Editor(QMainWindow):
                     self.rows[key] = n
                 self.names_by_need.setdefault(need or "", []).append(n)
             cols.addWidget(col, 0, Qt.AlignTop)
+        # the stack is as wide as the widest sheet; a shorter one keeps its
+        # columns together on the left rather than spread over that width
+        cols.addStretch(1)
         return page
 
     def _bound(self, does):
@@ -1895,39 +1957,28 @@ class Editor(QMainWindow):
 
     def _key_html(self, key):
         """The letter is what the eye is hunting for, so it is amber; what
-        qualifies it -- a modifier, `hold`, `drag` -- takes the dim colour."""
-        if key.startswith(("hold ", "⇧ ")):
-            word, rest = key.split(" ", 1)
-            return (f'<span style="color:{MODIFIER}">{word} </span>'
-                    f'<span style="color:{KEY}">{rest}</span>')
-        if len(key) > 1 and key[0] in "⌘⇧":
-            return (f'<span style="color:{MODIFIER}">{key[0]}</span>'
-                    f'<span style="color:{KEY}">{key[1:]}</span>')
-        # A gesture is not a key, so it does not take the key's amber.
-        dim = key in ("arrows", "← →", "↑ ↓", "drag", "drag a corner",
-                      "click", "del", "esc")
-        return f'<span style="color:{MODIFIER if dim else KEY}">{key}</span>'
+        qualifies it -- a modifier, `hold` -- takes the dim colour. A
+        gesture or a plain key on its own is not a letter to hunt for, and
+        is dim too."""
+        if key in ("arrows", "drag", "click", "del", "esc"):
+            return f'<span style="color:{MODIFIER}">{key}</span>'
+        out = []
+        for word in key.split(" "):
+            if word == "hold":
+                out.append(f'<span style="color:{MODIFIER}">hold</span>')
+                continue
+            out.append("".join(
+                f'<span style="color:{MODIFIER if ch in "⌘⇧⌥" else KEY}">{ch}</span>'
+                for ch in word))
+        return " ".join(out)
 
     def _signature(self):
-        who, site = self.identity
-        s = QLabel(f'<a href="#about" style="color:{EXPLAIN};'
-                   f'text-decoration:none">film-developer</a>'
-                   f'<span style="color:{ASLEEP}"> · </span>'
-                   f'<a href="https://{site}" style="color:{SUB};'
-                   f'text-decoration:none">{site}</a>' if site
-                   else "film-developer")
-        s.setTextFormat(Qt.RichText)
-        # linkActivated, not openExternalLinks, which would try to open
-        # `#about` as a URL.
-        s.linkActivated.connect(
-            lambda u: self._about() if u == "#about" else webbrowser.open(u))
-        return s
+        from .about import signature
+        return signature(self)
 
     def _about(self):
-        who, site = self.identity
-        sheets.say("film-developer", "film-developer",
-                   f"Find the picture inside a photographed negative."
-                   f"\n\n{who}\n{site}", self)
+        from .about import about_box
+        about_box(self)
 
     # Keys a text field is entitled to keep while it has the focus. The
     # crop is the only field in the window and it holds a number, so what
@@ -1999,8 +2050,9 @@ class Editor(QMainWindow):
                         ("Ctrl+D", self._redetect),
                         ("Ctrl+Shift+D", self._redetect_roll),
                         ("Ctrl+R", self._process),
-                        ("Ctrl+L", self._light_falloff),
-                        ("Ctrl+K", self._look),
+                        ("Ctrl+Shift+R", self._process_scan),
+                        ("Ctrl+L", self._look),
+                        ("Ctrl+Shift+L", self._light_falloff),
                         ):
             a = QAction(self)
             a.setShortcut(QKeySequence(key))
@@ -2064,10 +2116,10 @@ class Editor(QMainWindow):
             return self._hold_base()
         if k == Qt.Key_L and held and not e.isAutoRepeat():
             return self._hold_light(True)
-        if k == Qt.Key_S and fine and held:
-            # bare `s` marks dust; held with shift it shows the marks. The
-            # repeats are swallowed here, or they would fall through to `s`
-            return None if e.isAutoRepeat() else self._hold_specks(True)
+        if k == Qt.Key_C and held and not fine and not self.mode:
+            # the original, dust and all, while held -- the same key as in
+            # `s`; `⌘C` is a copy and never reaches here as held
+            return None if e.isAutoRepeat() else self._hold_dust(True)
         if ((self.canvas.view or "").startswith("result:")
                 and not self._walking()):
             # Turning while the frame is on screen, which is the only moment a
@@ -2160,14 +2212,12 @@ class Editor(QMainWindow):
     def keyReleaseEvent(self, e):
         if self.dusting:
             if e.key() == Qt.Key_C and not e.isAutoRepeat():
-                self._dust_cleaned(False)
+                self._dust_original(False)
             return
         if e.key() == Qt.Key_L and not e.isAutoRepeat() and self.flat_off:
             return self._hold_light(False)
-        if (e.key() in (Qt.Key_S, Qt.Key_Shift) and not e.isAutoRepeat()
-                and self.canvas.specks_on):
-            # either key let go first: shift-S held is one gesture
-            return self._hold_specks(False)
+        if e.key() == Qt.Key_C and not e.isAutoRepeat() and self.dust_off:
+            return self._hold_dust(False)
         if e.key() == Qt.Key_B and e.modifiers() & Qt.ShiftModifier:
             return                       # `⇧B` is a press, not a hold
         if ((e.key() == Qt.Key_B or Qt.Key_1 <= e.key() <= Qt.Key_4)
@@ -2178,6 +2228,10 @@ class Editor(QMainWindow):
             self._back_to_view()
 
     # ---- the three ways of looking
+    def _cycle_back(self):
+        """`⇧V`: the three ways of looking, the other way round."""
+        self._cycle(-1)
+
     def _cycle(self, step=1):
         """`v`: the scan, the positive, the develop -- one key, in order;
         `⇧V` the other way round.
@@ -2257,6 +2311,8 @@ class Editor(QMainWindow):
         if self.flat_off:
             word += (" · falloff corrected" if self.colour == "scan"
                      else " · falloff not corrected")
+        if self.dust_off:
+            word += " · original"
         return word
 
     CLIP_RED = (255, 40, 40)
@@ -2387,7 +2443,7 @@ class Editor(QMainWindow):
             if k[1] == "scan":
                 self.clip_masks.pop(k[0], None)
         self._clip_over = None
-        self._alt = None            # `hold l`'s pictures are of the same things
+        self._sets = {}             # the held keys' pictures are of the same things
 
     def _flat(self):
         """The rig's light falloff the roll names (`flatfield`), or None.
@@ -2408,6 +2464,16 @@ class Editor(QMainWindow):
 
     CACHES = ("mode_arrays", "mode_cache", "dev_plain", "dev_ev", "base_cache")
 
+    @property
+    def flat_off(self):
+        """`hold l` is down: the falloff the other way round."""
+        return self.held_other == "flat"
+
+    @property
+    def dust_off(self):
+        """`hold c` is down: the develop with its dust left in."""
+        return self.held_other == "dust"
+
     def _hold_light(self, on):
         """`hold l`: the stand's light falloff the other way round, for as
         long as the key is down -- **not corrected** on the positive and
@@ -2417,27 +2483,57 @@ class Editor(QMainWindow):
 
         Everything else is the roll's own: the base and the balance stay
         what the roll measured (under the calibration), so the difference
-        on screen is the falloff and nothing re-measured around it.
-
-        The pictures drawn this way are kept apart, as a second set of the
-        view caches swapped in while the key is down: one key of one size
-        was the alternative, and every cache the views write would have
-        needed a flag in its key and every reader a test for it. The other
-        set is dropped whenever the real one is (`_forget_modes`)."""
-        if on == self.flat_off:
-            return
+        on screen is the falloff and nothing re-measured around it."""
         if on and self._flat_named() is None:
             return self.status.setText("no light falloff calibration on this "
-                                       "roll — ⌘L chooses or makes one")
+                                       "roll — ⇧⌘L chooses or makes one")
+        self._hold_other("flat", on)
+
+    def _hold_dust(self, on):
+        """`hold c`: the original, the develop with the dust left in, for as
+        long as the key is down. The same key as inside `s`, where it is
+        the full-size frame; here it is the canvas's own develop."""
+        from . import dust
+        name = self.name()
+        marks = [m for m in (self._dust_record(name).get("marks", []) if name else [])
+                 if dust.used(m)]
+        if on and not marks:
+            return self.status.setText("no dust marked on this scan")
+        if on and self.colour != "develop":
+            return self.status.setText("the dust is taken out of the develop "
+                                       "only: v to it")
+        self._hold_other("dust", on)
+        if on:
+            n = len(marks)
+            self.status.setText(f"original: {n} mark{'s' if n != 1 else ''} "
+                                "left in")
+
+    def _hold_other(self, kind, on):
+        """Swap in the pictures drawn the other way, `kind` being `flat`
+        (`hold l`) or `dust` (`hold c`), and back when the key is let go.
+
+        They are kept apart, as another set of the view caches swapped in
+        while the key is down: one cache with a flag in every key was the
+        alternative, and every reader would have needed a test for it.
+        The sets not on screen wait in `_sets` -- `real` for the real one
+        while a key is down -- and are dropped whenever the real one is
+        (`_forget_modes`). One key at a time: two would be a third set."""
+        if on == (self.held_other == kind) or (on and self.held_other):
+            return
         # Whatever is developing now is of the set on screen; the roll's own
         # background run would fill the wrong one, so it waits.
         self._stop_prefetch()
+        fresh = lambda: {n: type(getattr(self, n))() for n in self.CACHES}
         here = {n: getattr(self, n) for n in self.CACHES}
-        other = self._alt or {n: type(here[n])() for n in self.CACHES}
+        if on:
+            self._sets["real"] = here
+            other = self._sets.pop(kind, None) or fresh()
+        else:
+            self._sets[kind] = here
+            other = self._sets.pop("real", None) or fresh()
         for n in self.CACHES:
             setattr(self, n, other[n])
-        self._alt = here
-        self.flat_off = on
+        self.held_other = kind if on else None
         self._clip_over = None
         # drawn again from the swapped caches: `_back_to_view` only puts
         # back the view, and the picture in it is still the other set's
@@ -2643,7 +2739,9 @@ class Editor(QMainWindow):
         taste = dict(develop.TASTE) | dict(self.doc["roll"].get("develop") or {})
         measured = dict(self.doc["roll"].get("measured") or {})
         one = self.doc["roll"].get("one_roll", True)
-        off = self.flat_off
+        held = self.held_other
+        if held == "dust":
+            item.pop("specks", None)            # `hold c`
 
         def job():
             # **The same job the pool runs**, so the two cannot produce two
@@ -2656,14 +2754,14 @@ class Editor(QMainWindow):
             if stats is None:
                 raise RuntimeError("the roll's base and balance are not "
                                    "measured yet")
-            if off:
+            if held == "flat":
                 stats["flat"] = None            # `hold l`
             _k, small, ev = develop.whole_job(
                 (path, item, part, stats, taste, one, image_io.PREVIEW_WIDTH))
             return None, small, ev
 
         self.dev_worker = _Render(key, job)
-        self.dev_worker.flat_off = off
+        self.dev_worker.held = held
         self.dev_worker.done.connect(self._developed_ready)
         self.dev_worker.failed.connect(self._developed_failed)
         self.dev_worker.start()
@@ -2678,7 +2776,7 @@ class Editor(QMainWindow):
         import os
         from . import develop
         self._stop_prefetch()
-        if self.colour != "develop" or self.mode or self.flat_off:
+        if self.colour != "develop" or self.mode or self.held_other:
             return
         if self.prefetch is not None and self.prefetch.isRunning():
             # The last one is still letting its running frames finish. Two
@@ -2770,7 +2868,7 @@ class Editor(QMainWindow):
             w.wait(5000)
 
     def _prefetched(self, key, small, evidence):
-        if key in self.dev_plain or self.flat_off:
+        if key in self.dev_plain or self.held_other:
             return
         self._keep_developed(key, small, evidence)
         if self.colour == "develop" and self.name() == key[0]:
@@ -2843,14 +2941,15 @@ class Editor(QMainWindow):
         return np.ascontiguousarray(out).astype(np.uint8)
 
     def _developed_ready(self, key, _unused, shown, evidence):
-        made_off = getattr(self.dev_worker, "flat_off", False)
+        made = getattr(self.dev_worker, "held", None)
         self._drop_worker()
-        if made_off != self.flat_off:
-            # developed for the other side of `hold l`, which was let go (or
-            # pressed) meanwhile: into that set, and this one asks again
-            if self._alt is not None:
-                self._alt["dev_plain"][key] = np.ascontiguousarray(shown)
-                self._alt["dev_ev"][key] = evidence
+        if made != self.held_other:
+            # developed for the other side of a held key, which was let go
+            # (or pressed) meanwhile: into that set, and this one asks again
+            into = self._sets.get(made or "real")
+            if into is not None:
+                into["dev_plain"][key] = np.ascontiguousarray(shown)
+                into["dev_ev"][key] = evidence
             if self.colour == "develop" and self.name() == key[0]:
                 self._want_developed()
             return
@@ -2915,7 +3014,7 @@ class Editor(QMainWindow):
         if name is None:
             self.dev_plain.clear()
             self.dev_ev.clear()
-            self._alt = None
+            self._sets = {}
         else:
             for k in [k for k in self.dev_plain if k[0] == name]:
                 self.dev_plain.pop(k)
@@ -3063,7 +3162,7 @@ class Editor(QMainWindow):
         that is a mode rather than an act."""
         w = (getattr(self, "rows", None) or {}).get("space")
         if w is not None:
-            w.setText("edit mode" if self.cut else "preview mode")
+            w.setText("whole scan" if self.cut else "preview")
 
     def _say_base(self, name=None):
         """`⇧B`'s row on the sheet says what the press will do to the scan
@@ -3073,7 +3172,7 @@ class Editor(QMainWindow):
         if w is not None:
             name = name or self.name()
             own = bool(name and (self.doc.get("bases") or {}).get(name))
-            w.setText("remove picked base" if own else "pick film base…")
+            w.setText("remove base" if own else "pick base…")
 
     def _show_cut(self):
         """Put the canvas on the selected part's cut, with the name of what
@@ -3135,7 +3234,8 @@ class Editor(QMainWindow):
             return self._add_part()
         if k == Qt.Key_Minus:
             return self._drop_part()
-        if k == Qt.Key_K and fine:
+        if k in (Qt.Key_Backspace, Qt.Key_Delete):
+            # back to what was measured: what was done by hand, deleted
             return self._reset()
         if k == Qt.Key_Z:
             # The narrower twin and the wider one share a letter and differ by
@@ -3147,7 +3247,8 @@ class Editor(QMainWindow):
         p = self.part()
         if k == Qt.Key_Escape:
             return self._leave_mode(apply=False)
-        if k in (Qt.Key_Return, Qt.Key_Enter):
+        if k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_E):
+            # `e` closes what `e` opened, as `s` does the dust
             return self._leave_mode(apply=True)
         if not p:
             return
@@ -3317,8 +3418,9 @@ class Editor(QMainWindow):
         mirrored = self.doc["roll"].get("mirrored", True)
         turn = int(prt.get("turn", 0) or 0) % 360
         self.dust = {"name": name, "part": prt["name"], "mirrored": mirrored,
-                     "turn": turn, "shape": None, "seen": set(), "patch": -1,
-                     "changed": False, "clean": None, "focus": None,
+                     "turn": turn, "shape": None,
+                     "changed": False, "clean": None, "marks_on": True,
+                     "original": False, "cleaned": {}, "focus": None,
                      "aff": np.array(develop.frame_to_scan(item, prt, taste))}
         self.was_looking = (self.colour, self.cut)
         self.dusting = True
@@ -3326,10 +3428,22 @@ class Editor(QMainWindow):
         self.canvas.view = "dust"
         self.canvas.pixmap_dev = None
         self.canvas.dust_marks = []
+        path, one = self.roll / name, self.doc["roll"].get("one_roll", True)
+        # **Kept, so `s` again is at once.** What is shown does not depend
+        # on the marks -- they are drawn over it, and `v` cleans the
+        # 8-bit picture -- only on everything the develop reads, which is
+        # the key: the frame, the roll's settings and measurement.
+        key = json.dumps([name, item, prt, taste, self.doc["roll"].get("measured"),
+                          one, mirrored, turn], sort_keys=True, default=str)
+        hit = self.dust_kept.get(key)
+        if hit is not None:
+            self.dust_kept[key] = self.dust_kept.pop(key)    # most recent last
+            self.dust["key"] = key
+            return self._dust_ready(("dust", name, prt["name"]), *hit)
+        self.dust["key"] = key
         self.canvas.label = "Developing the frame at full size to mark dust…"
         self.canvas.update()
         self.status.setText("developing at full size…")
-        path, one = self.roll / name, self.doc["roll"].get("one_roll", True)
 
         def job():
             out, ev = develop.develop_frame(path, item, prt, stats, taste, one)
@@ -3345,6 +3459,10 @@ class Editor(QMainWindow):
         self.dust_worker.failed.connect(self._dust_failed)
         self.dust_worker.start()
 
+    # Frames kept developed for `s`: 72 MB each at 24 MP, and going back
+    # and forth between a few is what marking a roll is.
+    DUST_KEEP = 4
+
     def _dust_ready(self, key, shape, shown, _evidence):
         w, self.dust_worker = self.dust_worker, None
         if w is not None:
@@ -3353,9 +3471,23 @@ class Editor(QMainWindow):
             return
         self.dust["shape"] = shape
         self.dust["shown"] = shown
+        kept = self.dust_kept
+        was = kept.pop(self.dust["key"], None)
+        kept[self.dust["key"]] = (shape, shown, _evidence)
+        while len(kept) > self.DUST_KEEP:
+            kept.pop(next(iter(kept)))
+        # and the frame with its dust out, as it was left: what changed
+        # since is cleaned again round each mark (`_dust_clean_view`)
+        out = self.dust_kept_clean.pop(self.dust["key"], None)
+        if out is not None and was is not None:
+            self.dust["clean"], self.dust["cleaned"] = out
+        for k in list(self.dust_kept_clean):
+            if k not in kept:
+                del self.dust_kept_clean[k]
         rec = self._dust_record(self.dust["name"])
         if rec and self._dust_number(rec):
             self.dirty = True
+        self.dust["before"] = copy.deepcopy(rec or None)
         self.canvas.pixmap_dev = _pix8(shown)
         self.canvas.label = "mark dust · frame %s" % self.dust["part"]
         self.canvas.cut_zoom, self.canvas.cut_pan = 1.0, QPointF(0, 0)
@@ -3372,16 +3504,17 @@ class Editor(QMainWindow):
     def _leave_dust(self):
         if not self.dusting:
             return
-        for attr in ("dust_worker", "dust_finder"):
-            w = getattr(self, attr)
-            setattr(self, attr, None)
-            if w is not None:
-                # nothing to be told; let finish and dropped rather than
-                # killed mid LibRaw read
-                w.done.disconnect()
-                w.failed.disconnect()
-                w.wait()
+        w, self.dust_worker = self.dust_worker, None
+        if w is not None:
+            # nothing to be told; let finish and dropped rather than
+            # killed mid LibRaw read
+            w.done.disconnect()
+            w.failed.disconnect()
+            w.wait()
         name = self.dust["name"]
+        if self.dust.get("clean") is not None and self.dust.get("key"):
+            self.dust_kept_clean[self.dust["key"]] = (self.dust["clean"],
+                                                      self.dust["cleaned"])
         n = len(self._dust_record(name).get("marks", []))
         changed = self.dust["changed"]
         self.dusting = False
@@ -3447,6 +3580,17 @@ class Editor(QMainWindow):
         d = self.dust
         if d["shape"] is None:
             return
+        # **The dust goes as it is marked**: the picture is always the
+        # frame with the marked dust taken out, and `hold c` the frame as
+        # it was, to compare
+        if d["original"]:
+            if d.get("shown_pm") is None:
+                d["shown_pm"] = _pix8(d["shown"])
+            self.canvas.pixmap_dev = d["shown_pm"]
+            self.canvas.label = "as it was, with its dust · frame %s" % d["part"]
+        else:
+            self.canvas.pixmap_dev = self._dust_clean_view()
+            self.canvas.label = "mark dust · frame %s" % d["part"]
         pm = self.canvas.pixmap_dev
         marks = []
         count = {"hand": 0, "accepted": 0, "proposed": 0, "refused": 0}
@@ -3454,16 +3598,24 @@ class Editor(QMainWindow):
             style = "hand" if m.get("by", "hand") == "hand" else m.get("state", "proposed")
             count[style] = count.get(style, 0) + 1
             x, y = self._dust_shown(*self._dust_from_scan(m["x"], m["y"]))
-            if -20 <= x <= pm.width() + 20 and -20 <= y <= pm.height() + 20:
-                marks.append((x, y, style, m is d["focus"], m.get("r")))
-        self.canvas.dust_marks = marks
+            path = [self._dust_shown(*self._dust_from_scan(px, py))
+                    for px, py in m["path"]] if m.get("path") else None
+            src = (self._dust_shown(*self._dust_from_scan(
+                m["x"] + m["from"][0], m["y"] + m["from"][1]))
+                if m.get("from") else None)
+            if path or -20 <= x <= pm.width() + 20 and -20 <= y <= pm.height() + 20:
+                marks.append((x, y, style, m is d["focus"], m.get("r"), path, src))
+        # `v` hides them, to judge what is left; the ring and the number
+        # still say what is under the pointer, so marking goes on
+        # nor while ⌘ is choosing where to clone from: the mark would
+        # cover what it is about to become
+        self.canvas.dust_marks = (marks if d["marks_on"] and not d.get("cloning")
+                                  else [])
         n = count["hand"]
         said = f"{n} marked by hand"
         if count["accepted"] + count["proposed"] + count["refused"]:
             said += (f" · found: {count['accepted']} accepted, "
                      f"{count['proposed']} undecided, {count['refused']} refused")
-        if d["patch"] >= 0:
-            said += f" · patch {d['patch'] + 1} of {self._dust_patches()[2]}"
         self.status.setText(said)
         self.canvas.update()
 
@@ -3492,104 +3644,340 @@ class Editor(QMainWindow):
         elif hit is not None:
             marks.pop(hit[1])
         else:
+            # a dab of the brush: a stroke one point long, filled as it is
+            # painted and resizable after. The old click -- a point grown
+            # into the speck under it -- is still read from documents that
+            # have it, and no longer made.
+            from . import dust
             sx, sy = self._dust_scan(*self._dust_frame(x, y))
-            mark = {"x": round(float(sx), 1), "y": round(float(sy), 1), "by": "hand"}
-            if self.canvas.dust_brush:
-                mark["r"] = round(self.canvas.dust_brush, 1)
-            marks.append(mark)
+            sx, sy = round(float(sx), 1), round(float(sy), 1)
+            r = float(self.canvas.dust_brush or dust.STROKE_R)
+            marks.append({"x": sx, "y": sy, "path": [[sx, sy]],
+                          "r": round(r, 1), "by": "hand"})
             self._dust_number(rec)
-        d["changed"], d["clean"] = True, None
+        d["changed"] = True
+        self._dust_undoable()
         self.dirty = True
         self._dust_draw()
 
-    def _hold_specks(self, on):
-        """`hold ⇧S`: the scan's dust marks drawn over the picture, while
-        held. The develop has taken them out, so with the key down the
-        circles say where the dust was and letting go shows what was done
-        there. On the whole scan and on the cut frame, in any of the three
-        ways of looking -- the marks are in scan pixels and every view can
-        put them where they belong."""
-        from . import develop
-        c = self.canvas
-        if not on:
-            c.specks_on, c.specks_scan, c.specks_cut = False, [], []
-            return c.update()
-        name, it = self.name(), self.item()
-        from . import dust
-        marks = [m for m in (self._dust_record(name).get("marks", []) if name else [])
-                 if dust.used(m)]
-        if not marks:
-            return self.status.setText("no dust marked on this scan")
-        c.specks_on = True
-        c.specks_scan = [(m["x"], m["y"]) for m in marks]
-        c.specks_cut = []
-        pm, part = c.pixmap_dev, self.part()
-        if c.view == "developed" and pm is not None and part is not None:
-            # the cut develop: scan -> the full-size frame -> this picture,
-            # which is the same cut at `scale` and then mirrored and turned
-            taste = dict(develop.TASTE) | dict(self.doc["roll"].get("develop") or {})
-            a = np.array(develop.frame_to_scan(it, part, taste))
-            inv = np.linalg.inv(a[:, :2])
-            turn = int(part.get("turn", 0) or 0) % 360
-            w, h = (pm.width(), pm.height()) if turn in (0, 180) else \
-                (pm.height(), pm.width())
-            base = self.dev_plain.get((name, part["name"]))
-            scale = it["scan"][0] / max(base.shape[1], 1) if base is not None else 4.0
-            for sx, sy in c.specks_scan:
-                x, y = (inv @ (np.array([sx, sy]) - a[:, 2]) + 0.5) / scale - 0.5
-                if self.doc["roll"].get("mirrored", True):
-                    x = w - 1 - x
-                qw, qh = w, h
-                for _ in range(turn // 90):
-                    x, y = qh - 1 - y, x
-                    qw, qh = qh, qw
-                c.specks_cut.append((x, y))
-        n = len(marks)
-        self.status.setText(f"{n} speck{'s' if n != 1 else ''} marked, "
-                            "taken out of the develop")
-        c.update()
+    def _dust_stroke(self, pts):
+        """A drag in the mode: a stroke along a scratch or a hair, stored as
+        its path in scan pixels and the brush's radius (`dust.samples`).
 
-    def _dust_cleaned(self, on):
-        """`hold c`: the frame with the marked dust taken out, where it is
-        marked and at the zoom it is marked at. The develop does the same
-        to its linear picture before the automatics (`develop._cleaned`);
-        here it is done to the 8-bit picture on screen, which is what is
-        being judged and costs a fraction of a second, not a develop."""
+        Kept a point every half radius or so: a drag reports a point every
+        couple of screen pixels, and at the whole frame that is tens of
+        scan pixels apart, at 100 % one -- the document wants the line, not
+        the mouse's sampling of it."""
         from . import dust
         d = self.dust
         if not self.dusting or d["shape"] is None:
             return
-        if on:
-            if d["clean"] is None:
-                img = d["shown"].astype(np.float32) / 255.0
-                pts = [self._dust_shown(*self._dust_from_scan(m["x"], m["y"]))
-                       + (m.get("r"),)
-                       for m in self._dust_record(d["name"]).get("marks", [])
-                       if dust.used(m)]
-                d["clean"] = _pix8(np.clip(dust.clean(img, pts, 1.0) * 255.0
-                                           + 0.5, 0, 255).astype(np.uint8))
-            self.canvas.pixmap_dev = d["clean"]
-            self.canvas.dust_marks = []
-            self.canvas.label = "dust taken out · frame %s" % d["part"]
-            self.canvas.update()
+        pm = self.canvas.pixmap_dev
+        r = float(self.canvas.dust_brush or dust.STROKE_R)
+        path = []
+        for pos in pts:
+            x, y = self.canvas.dust_at(pos)
+            if not (0 <= x < pm.width() and 0 <= y < pm.height()):
+                continue
+            sx, sy = self._dust_scan(*self._dust_frame(x, y))
+            if not path or math.hypot(sx - path[-1][0], sy - path[-1][1]) >= max(1.0, r / 2):
+                path.append([round(float(sx), 1), round(float(sy), 1)])
+        if len(path) < 2:
+            return
+        rec = self.doc.setdefault("specks", {}).setdefault(d["name"], {})
+        mid = path[len(path) // 2]
+        rec.setdefault("marks", []).append(
+            {"x": mid[0], "y": mid[1], "path": path, "r": round(r, 1), "by": "hand"})
+        self._dust_number(rec)
+        d["changed"] = True
+        self._dust_undoable()
+        self.dirty = True
+        self._dust_draw()
+
+    def _dust_undoable(self, resize=None):
+        """After a change to the marks: what they were before it, onto the
+        undo list, so `⌘Z` takes a mark back -- or puts back one taken away.
+
+        The state before is kept from the last change (`dust["before"]`)
+        rather than taken at each of the six places that change marks.
+        Notches of the wheel on one mark, close together, are one change:
+        undoing a resize a notch at a time would be twenty `⌘Z`."""
+        d = self.dust
+        now = time.monotonic()
+        same = (resize is not None and d.get("resizing") is resize
+                and now - d.get("resized", 0) < 1.5 and self.undo
+                and self.undo[-1][0] == self.DUST)
+        if not same:
+            self.undo.append((self.DUST, (d["name"], d.get("before"))))
+            del self.undo[:-60]
+            self.redo.clear()
+        d["resizing"], d["resized"] = resize, now
+        d["before"] = copy.deepcopy(self._dust_record(d["name"]) or None)
+
+    def _set_dust(self, name, rec, said):
+        """`⌘Z` / `⇧⌘Z` on a dust entry: the scan's marks as `rec`."""
+        specks = self.doc.setdefault("specks", {})
+        if rec is None:
+            specks.pop(name, None)
         else:
-            self.canvas.pixmap_dev = _pix8(d["shown"])
-            self.canvas.label = "mark dust · frame %s" % d["part"]
+            specks[name] = copy.deepcopy(rec)
+        self.dirty = True
+        d = self.dust
+        if self.dusting and d["name"] == name:
+            d["before"] = copy.deepcopy(rec)
+            d["focus"], d["changed"], d["resizing"] = None, True, None
             self._dust_draw()
+            n = sum(1 for m in (rec or {}).get("marks", [])
+                    if m.get("by", "hand") == "hand")
+            self.status.setText(f"{said} · {n} marked by hand")
+        else:
+            self._forget_developed(name)
+            self.status.setText(f"{said} on {name}")
+
+    # How far a ⌘ + drag must go to be a drag and not a click: screen px.
+    CLONE_MOVE = 4
+
+    def _dust_clone_press(self, pos):
+        """`⌘` + press on a mark: what it is cloned from is about to move
+        with the pointer (`_dust_clone_drag`), and the marks hide so the
+        picture under them shows. **For where the automatic fill gets it
+        wrong**: it takes the patch whose ring best matches the hole's,
+        which on an edge of the scene can be the wrong side of it, and a
+        person sees the right place at once."""
+        d = self.dust
+        if not self.dusting or d["shape"] is None:
+            return
+        m = self._dust_hit(pos)
+        if m is None or m.get("by", "hand") != "hand" or not m.get("path"):
+            return self.status.setText("⌘ + drag on a mark to choose what it "
+                                       "is cloned from")
+        d["cloning"] = {"mark": m, "start": pos, "moved": False,
+                        "from": list(m.get("from") or (0.0, 0.0)),
+                        "at": self._dust_scan(*self._dust_frame(
+                            *self.canvas.dust_at(pos)))}
+        self._dust_draw()
+        self._dust_clone_preview(m, d["cloning"]["from"])
+
+    def _dust_clone_off(self, pos):
+        """The way to the source for the pointer at `pos`: where it was at
+        the press, less how far the pointer has gone -- **what is cloned
+        follows the hand**, as if the picture were slid under the mark."""
+        c = self.dust["cloning"]
+        sx, sy = self._dust_scan(*self._dust_frame(*self.canvas.dust_at(pos)))
+        return [round(float(c["from"][0] - (sx - c["at"][0])), 1),
+                round(float(c["from"][1] - (sy - c["at"][1])), 1)]
+
+    def _dust_clone_drag(self, pos):
+        d = self.dust
+        c = d.get("cloning") if self.dusting and d else None
+        if not c:
+            return
+        if (pos - c["start"]).manhattanLength() >= self.CLONE_MOVE:
+            c["moved"] = True
+        self._dust_clone_preview(c["mark"], self._dust_clone_off(pos))
+
+    def _dust_clone_cancel(self):
+        d = self.dust
+        if not self.dusting or not d.get("cloning"):
+            return
+        d["cloning"] = None
+        self.canvas.dust_overlay = self.canvas.dust_source = None
+        self._dust_draw()
+
+    def _dust_clone_preview(self, m, off):
+        """Mark `m` as it would come out cloned from `off` (scan pixels):
+        copied and healed on the picture on screen, the same `dust.clone`
+        the develop runs, and laid over it."""
+        from . import dust
+        d = self.dust
+        to_shown = lambda x, y: self._dust_shown(*self._dust_from_scan(x, y))
+        mx, my = to_shown(m["x"], m["y"])
+        fx, fy = to_shown(m["x"] + off[0], m["y"] + off[1])
+        self.canvas.dust_source = ((mx, my), (fx, fy))
+        base = d["shown"] if d["original"] else d.get("clean")
+        if base is None:
+            return self.canvas.update()
+        H, W = base.shape[:2]
+        pts = [(*to_shown(x, y), r) for x, y, r, _ in dust.samples(dict(m, **{"from": None}))]
+        rad = max(r for *_, r in pts) + 8
+        x0 = max(0, int(min(p[0] for p in pts) - rad))
+        y0 = max(0, int(min(p[1] for p in pts) - rad))
+        x1 = min(W, int(max(p[0] for p in pts) + rad) + 1)
+        y1 = min(H, int(max(p[1] for p in pts) + rad) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        h = np.zeros((H, W), bool)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        for x, y, r, *_ in pts:
+            h[y0:y1, x0:x1] |= (xx - x) ** 2 + (yy - y) ** 2 <= r * r
+        # on a copy of the box and the source's box only: the whole frame
+        # per movement of the mouse would be 70 MB a time. From the
+        # picture without this mark's own fill, which is what it replaces.
+        dx, dy = int(round(fx - mx)), int(round(fy - my))
+        X0, Y0 = max(0, min(x0, x0 + dx) - 8), max(0, min(y0, y0 + dy) - 8)
+        X1, Y1 = min(W, max(x1, x1 + dx) + 8), min(H, max(y1, y1 + dy) + 8)
+        work = base[Y0:Y1, X0:X1].astype(np.float32) / 255.0
+        dust.clone(work, h[Y0:Y1, X0:X1], dy, dx)
+        out = np.clip(work[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0] * 255.0 + 0.5,
+                      0, 255).astype(np.uint8)
+        self.canvas.dust_overlay = (_pix8(np.ascontiguousarray(out)), x0, y0)
+        self.canvas.update()
+
+    def _dust_clone_release(self, pos):
+        """The drag let go: the mark keeps the source it shows. A click
+        that did not move takes its source away, and the automatic fill
+        is back."""
+        d = self.dust
+        c = d.get("cloning") if self.dusting and d else None
+        if not c:
+            return
+        m = c["mark"]
+        off = self._dust_clone_off(pos)
+        self._dust_clone_cancel()
+        if not c["moved"]:
+            if not m.get("from"):
+                return
+            m.pop("from")
+            said = "filled by the automatic again"
+        else:
+            m["from"] = off
+            said = (f"cloned from {abs(off[0]):.0f}, {abs(off[1]):.0f} px away "
+                    "· ⌘ + click it for the automatic fill again")
+        d["changed"] = True
+        self._dust_undoable()
+        self.dirty = True
+        self._dust_draw()
+        self.status.setText(f"#{m.get('id', '?')} {said}")
+
+    def _dust_see(self):
+        """`v`: the marks drawn over the picture, or not. The picture has
+        the dust taken out either way (`_dust_draw`), so with them hidden
+        what is left of the dust is what shows -- and marking goes on."""
+        d = self.dust
+        if not self.dusting or d["shape"] is None:
+            return
+        d["marks_on"] = not d["marks_on"]
+        self._dust_draw()
+
+    def _dust_original(self, on):
+        """`hold c`: the frame as it was, with all its dust, while held."""
+        d = self.dust
+        if not self.dusting or d["shape"] is None or d["original"] == on:
+            return
+        d["original"] = on
+        self._dust_draw()
+
+    # Round what is cleaned again, the picture it may read: as far as any
+    # piece looks for its patch (`dust.COPY_REACH` pieces of `dust.PIECE`,
+    # and the 6 px of room `dust` gives it) and a margin. With that, and
+    # every mark it reaches taken whole, the box comes out as the whole
+    # frame would (`_dust_clean_view`).
+    SEE_PAD = int(3 * 32 + 6 + 8)
+
+    def _dust_clean_view(self):
+        """The 8-bit picture on screen with the dust that is used taken
+        out, kept up to date with the marks. The develop does the same to
+        its linear picture before the automatics (`develop._cleaned`); here
+        it is done to what is being judged, which costs a fraction of a
+        second and not a develop.
+
+        **Only round what changed.** Each used mark is remembered as it was
+        cleaned; a mark added, removed, moved or resized has the box round
+        it, before and after, cleaned again from the picture with every
+        mark that reaches into it, and pasted back. More than a few at once
+        -- `⇧A`, finding again -- and the whole frame is done again."""
+        import json
+        from . import dust
+        d = self.dust
+        to_shown = lambda x, y: self._dust_shown(*self._dust_from_scan(x, y))
+        used = [m for m in self._dust_record(d["name"]).get("marks", [])
+                if dust.used(m)]
+        now = {str(m.get("id", i)): json.dumps(m, sort_keys=True)
+               for i, m in enumerate(used)}
+        was = d["cleaned"]
+        if d["clean"] is not None and now == was:
+            if d.get("clean_pm") is None:
+                d["clean_pm"] = _pix8(d["clean"])
+            return d["clean_pm"]
+        shown = d["shown"]
+        H, W = shown.shape[:2]
+
+        def box(mark):
+            pts = [(*to_shown(x, y), r) for x, y, r, _ in dust.samples(mark)]
+            if mark.get("from"):
+                # and where it is cloned from, which is read
+                fx, fy = mark["from"]
+                pts += [(*to_shown(x + fx, y + fy), r)
+                        for x, y, r, _ in dust.samples(mark)]
+            rad = max((r or 40.0) for *_, r in pts) + 8
+            return (min(p[0] for p in pts) - rad, min(p[1] for p in pts) - rad,
+                    max(p[0] for p in pts) + rad, max(p[1] for p in pts) + rad)
+
+        def clean(x0, y0, x1, y1):
+            x0, y0 = max(0, int(x0)), max(0, int(y0))
+            x1, y1 = min(W, int(math.ceil(x1))), min(H, int(math.ceil(y1)))
+            img = shown[y0:y1, x0:x1].astype(np.float32) / 255.0
+            pts = dust.points(used, lambda x, y: tuple(
+                np.subtract(to_shown(x, y), (x0, y0))))
+            return x0, y0, np.clip(dust.clean(img, pts, 1.0) * 255.0 + 0.5,
+                                   0, 255).astype(np.uint8)
+
+        touched = set(now) ^ set(was) | {k for k in now if k in was and now[k] != was[k]}
+        if d["clean"] is None or len(touched) > 4:
+            d["clean"] = clean(0, 0, W, H)[2]
+        else:
+            # **The same picture the whole frame gives, whatever order the
+            # marks were made in.** What changed, then every mark whose box
+            # touches it, then every mark touching those: marks that overlap
+            # are one hole, filled together, and a box that cut one of them
+            # filled a different hole -- 18 000 px, up to 57 levels, after a
+            # long stroke. Marks further off only matter as where no patch
+            # may come from, and the `SEE_PAD` round the box reads them.
+            boxes = {str(m.get("id", i)): box(m) for i, m in enumerate(used)}
+            seeds = [boxes[k] for k in touched if k in boxes]
+            seeds += [box(json.loads(was[k])) for k in touched if k in was]
+            P = self.SEE_PAD
+            T = dust.CLOSE + 1           # the closing joins holes this close
+            out = d["clean"].copy()
+            while seeds:
+                r = list(seeds.pop())
+                grown = True
+                while grown:
+                    grown = False
+                    for k, (bx0, by0, bx1, by1) in list(boxes.items()):
+                        if (bx0 < r[2] + T and bx1 > r[0] - T
+                                and by0 < r[3] + T and by1 > r[1] - T):
+                            r = [min(r[0], bx0), min(r[1], by0),
+                                 max(r[2], bx1), max(r[3], by1)]
+                            del boxes[k]
+                            grown = True
+                # a seed this one swallowed is done with it
+                seeds = [b for b in seeds if not (b[0] >= r[0] and b[1] >= r[1]
+                                                  and b[2] <= r[2] and b[3] <= r[3])]
+                x0, y0, part = clean(r[0] - P, r[1] - P, r[2] + P, r[3] + P)
+                px0, py0 = max(0, int(r[0])), max(0, int(r[1]))
+                px1, py1 = min(W, int(math.ceil(r[2]))), min(H, int(math.ceil(r[3])))
+                if px1 > px0 and py1 > py0:
+                    out[py0:py1, px0:px1] = part[py0 - y0:py1 - y0, px0 - x0:px1 - x0]
+            d["clean"] = out
+        d["cleaned"] = now
+        d["clean_pm"] = _pix8(d["clean"])
+        return d["clean_pm"]
 
     BRUSH_STEP = 1.15    # per notch of the wheel
     BRUSH_MIN, BRUSH_MAX = 2.0, 300.0   # picture px, which are scan px
 
     def _dust_resize(self, pos, steps):
         """`⇧` + the wheel: the size of the mark under the pointer, or, with
-        none there, of the ring a click will make.
+        none there, of the brush a click dabs and a drag paints with.
 
         **A size is a radius in scan pixels and it is exact**: the develop
-        fills that disc and does not look for the speck's own extent
-        (`dust.clean`). Without one the speck is grown from the click,
-        which is right for most and short for some -- a white fleck on a
-        brown wall on DSC_0238 kept a rim. Shrunk below `BRUSH_MIN` a mark
-        goes back to having none, and so does the ring."""
+        fills what was painted and does not look for the speck's own extent
+        (`dust.clean`). A mark from before the brush, a point with no size,
+        is grown from the click instead -- right for most and short for
+        some, a white fleck on a brown wall on DSC_0238 kept a rim -- and
+        shrunk below `BRUSH_MIN` it goes back to having none. A dab or a
+        stroke always has a width, and so does the brush."""
         d = self.dust
         if not self.dusting or d["shape"] is None:
             return
@@ -3600,26 +3988,25 @@ class Editor(QMainWindow):
             if not m.get("r") and steps < 0:
                 return                  # already as small as it goes
             r = (m.get("r") or 8.0) * f
+            if m.get("path") and r < self.BRUSH_MIN:
+                return                  # a stroke always has a width
             if r < self.BRUSH_MIN:
                 m.pop("r", None)
             else:
                 m["r"] = round(min(r, self.BRUSH_MAX), 1)
             from . import dust
             if dust.used(m):
-                d["changed"], d["clean"] = True, None
+                d["changed"] = True
+            self._dust_undoable(resize=m)
             self.dirty = True
             self._dust_draw()
             self.status.setText(self.status.text() + " · this one: "
                                 + (f"{m['r']:.0f} px" if m.get("r") else "found under the click"))
         else:
-            if not self.canvas.dust_brush and steps < 0:
-                return
-            r = (self.canvas.dust_brush or 8.0) * f
-            self.canvas.dust_brush = (None if r < self.BRUSH_MIN
-                                      else min(r, self.BRUSH_MAX))
-            b = self.canvas.dust_brush
-            self.status.setText("a click marks " + (f"a disc of {b:.0f} px radius"
-                                                    if b else "the speck found under it"))
+            from . import dust as dust_
+            r = (self.canvas.dust_brush or dust_.STROKE_R) * f
+            self.canvas.dust_brush = min(max(r, self.BRUSH_MIN), self.BRUSH_MAX)
+            self.status.setText(f"brush: {self.canvas.dust_brush:.0f} px radius")
             self.canvas.update()
 
     def _dust_number(self, rec):
@@ -3647,9 +4034,12 @@ class Editor(QMainWindow):
         m = self._dust_hit(pos)
         if m is None:
             return None
-        what = "hand" if m.get("by", "hand") == "hand" else \
+        what = ("stroke" if len(m.get("path") or ()) > 1 else
+                "dab" if m.get("path") else "hand") if m.get("by", "hand") == "hand" else \
             f"found {m.get('kind', '')}, {m.get('state', 'proposed')}"
         size = f", r {m['r']:.0f} px" if m.get("r") else ""
+        if m.get("from"):
+            size += ", cloned"
         return f"#{m.get('id', '?')} · {what}{size}"
 
     def _dust_hit(self, pos):
@@ -3657,200 +4047,25 @@ class Editor(QMainWindow):
         best = None
         k = self.canvas.dust_scale()[0]
         for m in self._dust_record(self.dust["name"]).get("marks", []):
-            p = self.canvas.dust_screen(*self._dust_shown(
-                *self._dust_from_scan(m["x"], m["y"])))
-            dd = math.hypot(p.x() - pos.x(), p.y() - pos.y())
-            reach = m["r"] * k + 1.5 if m.get("r") else max(11.0, 8 * k)
+            if m.get("path"):
+                ps = [self.canvas.dust_screen(*self._dust_shown(
+                    *self._dust_from_scan(px, py))) for px, py in m["path"]]
+                dd = (math.hypot(ps[0].x() - pos.x(), ps[0].y() - pos.y())
+                      if len(ps) == 1 else
+                      min(_to_segment(pos, a, b) for a, b in zip(ps, ps[1:])))
+            else:
+                p = self.canvas.dust_screen(*self._dust_shown(
+                    *self._dust_from_scan(m["x"], m["y"])))
+                dd = math.hypot(p.x() - pos.x(), p.y() - pos.y())
+            reach = max(6.0, m["r"] * k + 1.5) if m.get("r") else max(11.0, 8 * k)
             if dd <= reach and (best is None or dd < best[0]):
                 best = (dd, m)
         return best[1] if best else None
-
-    def _dust_find(self):
-        """`d`: look for dust, and put what is found forward as proposals.
-
-        **Proposed is not used.** The develop takes out what was marked by
-        hand and what a person accepted (`dust.used`), and nothing else: on
-        DSC_0238 the finder was right about 9 of the 34 film specks it put
-        forward, so what it says is a list to go through, not a result.
-        Finding again replaces the undecided ones and keeps every decision
-        -- accepted and refused alike -- and a proposal on top of a mark
-        that is already there is dropped.
-
-        The rig's specks come from the blank frames beside the scans
-        (`blank/`), when there are any: they sit at the same place in every
-        shot of a session, so the blanks see them with no picture in the way.
-        """
-        from . import dust
-        d = self.dust
-        if not self.dusting or d["shape"] is None or self.dust_finder is not None:
-            return
-        name, part = d["name"], d["part"]
-        it = copy.deepcopy(self.doc["items"][name])
-        prt = next(q for q in it["parts"] if q["name"] == part)
-        path = self.roll / name
-        blanks = sorted(p for p in (self.roll / "blank").glob("*" + path.suffix))
-        self.status.setText("finding dust…" + (
-            f" (and the rig's, from {len(blanks)} blanks)" if blanks else ""))
-        self.canvas.label = "finding dust…"
-        self.canvas.update()
-
-        def job():
-            return None, dust.find(path, it, prt, blanks), None
-
-        self.dust_finder = _Render(("find", name, part), job)
-        self.dust_finder.done.connect(self._dust_found)
-        self.dust_finder.failed.connect(self._dust_found_failed)
-        self.dust_finder.start()
-
-    def _dust_found(self, key, _none, found, _ev):
-        w, self.dust_finder = self.dust_finder, None
-        if w is not None:
-            w.wait()
-        d = self.dust
-        if not self.dusting or key[1:] != (d["name"], d["part"]):
-            return
-        self.canvas.label = "mark dust · frame %s" % d["part"]
-        rec = self.doc.setdefault("specks", {}).setdefault(d["name"], {})
-        marks = [m for m in rec.get("marks", [])
-                 if not (m.get("by") == "found" and m.get("state") == "proposed")]
-        kept = len(marks)
-        for f in found:
-            # the same speck already marked, by hand or decided: within its
-            # own radius and a few pixels more
-            r = math.sqrt(f.get("area", 16) / math.pi) + 8
-            if all(math.hypot(m["x"] - f["x"], m["y"] - f["y"]) > r for m in marks):
-                marks.append(f)
-        rec["marks"] = marks
-        self._dust_number(rec)
-        d["focus"], d["clean"] = None, None
-        self.dirty = True
-        self._dust_draw()
-        self.status.setText(self.status.text() + f" · {len(marks) - kept} new")
-
-    def _dust_found_failed(self, key, why):
-        w, self.dust_finder = self.dust_finder, None
-        if w is not None:
-            w.wait()
-        if self.dusting:
-            self.canvas.label = "mark dust · frame %s" % self.dust["part"]
-            self.status.setText(f"not found: {why}")
-            self.canvas.update()
-
-    def _dust_proposed(self):
-        """The undecided ones, in reading order on the picture."""
-        marks = self._dust_record(self.dust["name"]).get("marks", [])
-        out = [m for m in marks
-               if m.get("by") == "found" and m.get("state") == "proposed"]
-        pos = {id(m): self._dust_shown(*self._dust_from_scan(m["x"], m["y"]))
-               for m in out}
-        return sorted(out, key=lambda m: (round(pos[id(m)][1] / 200), pos[id(m)][0]))
-
-    def _dust_go(self, step):
-        """`.` `,`: the next undecided one, at 100 % in the middle."""
-        d = self.dust
-        if not self.dusting or d["shape"] is None:
-            return
-        todo = self._dust_proposed()
-        if not todo:
-            d["focus"] = None
-            self._dust_draw()
-            return self.status.setText(self.status.text() + " · nothing undecided")
-        # by identity: two proposals can be equal dicts (the rig's and the
-        # film's on one spot), and `index` would find the first
-        at = [i for i, m in enumerate(todo) if m is d["focus"]]
-        if at:
-            i = (at[0] + step) % len(todo)
-        else:
-            i = 0 if step > 0 else len(todo) - 1
-        m = d["focus"] = todo[i]
-        self.canvas.dust_show(*self._dust_shown(*self._dust_from_scan(m["x"], m["y"])),
-                              self._dust_one_to_one())
-        self._dust_draw()
-
-    def _dust_decide(self, state, every=False):
-        """`a` `x`: accept or refuse the one in view, and on to the next;
-        `⇧A` `⇧X`: every undecided one at once."""
-        d = self.dust
-        if not self.dusting or d["shape"] is None:
-            return
-        todo = self._dust_proposed()
-        if every:
-            for m in todo:
-                m["state"] = state
-            d["focus"] = None
-        else:
-            m = d["focus"]
-            at = [i for i, t in enumerate(todo) if t is m]
-            if not at:
-                return self.status.setText("go to one first: `.`")
-            nxt = todo[(at[0] + 1) % len(todo)] if len(todo) > 1 else None
-            m["state"] = state
-            d["focus"] = None
-            if nxt is not None:
-                d["focus"] = nxt
-                self.canvas.dust_show(*self._dust_shown(
-                    *self._dust_from_scan(nxt["x"], nxt["y"])), self._dust_one_to_one())
-        d["changed"], d["clean"] = True, None
-        self.dirty = True
-        self._dust_draw()
-
-    def _dust_forget(self):
-        """`del`: every found mark goes, undecided and refused alike, but
-        the accepted ones: a person looked at those and said *dust*, and
-        they are being taken out of the develop. One of them goes the way
-        any mark does, with a click (accepted -> refused) and `del`."""
-        d = self.dust
-        if not self.dusting:
-            return
-        rec = self._dust_record(d["name"])
-        if not rec:
-            return
-        before = len(rec.get("marks", []))
-        rec["marks"] = [m for m in rec.get("marks", [])
-                        if m.get("by", "hand") == "hand" or m.get("state") == "accepted"]
-        d["focus"] = None
-        self.dirty = True
-        self._dust_draw()
-        self.status.setText(self.status.text()
-                            + f" · {before - len(rec['marks'])} found removed")
 
     def _dust_one_to_one(self):
         """Screen pixels per picture pixel at 100 %: one picture pixel to a
         pixel of the display, not to a point of the layout."""
         return 1.0 / max(self.canvas.devicePixelRatioF(), 1.0)
-
-    def _dust_patches(self):
-        """The grid the sweep walks at 100 %: (patch w, patch h, how many,
-        columns). A little overlap, so a speck on a seam is in both."""
-        pm = self.canvas.pixmap_dev
-        k = self._dust_one_to_one()
-        pw = max(1, int(self.canvas.width() / k * 0.9))
-        ph = max(1, int(self.canvas.height() / k * 0.9))
-        cols = math.ceil(pm.width() / pw)
-        rows = math.ceil(pm.height() / ph)
-        return pw, ph, cols * rows, cols
-
-    def _dust_next(self, step=1):
-        """The next patch of the frame at 100 %, in reading order. **Recall
-        needs it**: a speck nobody marked is only a miss if somebody looked
-        there, and walking a grid is how to know the whole frame was seen.
-        How many patches were seen goes into the document beside the marks."""
-        d = self.dust
-        if not self.dusting or d["shape"] is None:
-            return
-        pw, ph, n, cols = self._dust_patches()
-        d["patch"] = (d["patch"] + step) % n
-        r, c = divmod(d["patch"], cols)
-        pm = self.canvas.pixmap_dev
-        self.canvas.dust_show(min(pm.width(), c * pw + pw / 2),
-                              min(pm.height(), r * ph + ph / 2),
-                              self._dust_one_to_one())
-        d["seen"].add(d["patch"])
-        rec = self.doc.setdefault("specks", {}).setdefault(d["name"], {})
-        rec.setdefault("swept", {})[d["part"]] = {
-            "patches_seen": len(d["seen"]), "patches": n}
-        self.dirty = True
-        self._dust_draw()
 
     def _dust_zoom(self):
         """100 % about the middle of the window, or back to the whole frame."""
@@ -3870,28 +4085,14 @@ class Editor(QMainWindow):
     def _dust_key(self, k, mods):
         if k in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter, Qt.Key_S):
             return self._leave_dust()
+        if k == Qt.Key_V:
+            return self._dust_see()
         if k == Qt.Key_C:
-            return self._dust_cleaned(True)
-        if k == Qt.Key_D:
-            return self._dust_find()
-        if k == Qt.Key_Period:
-            return self._dust_go(1)
-        if k == Qt.Key_Comma:
-            return self._dust_go(-1)
-        if k == Qt.Key_A:
-            return self._dust_decide("accepted", bool(mods & Qt.ShiftModifier))
-        if k == Qt.Key_X:
-            return self._dust_decide("refused", bool(mods & Qt.ShiftModifier))
-        if k in (Qt.Key_Delete, Qt.Key_Backspace):
-            return self._dust_forget()
+            return self._dust_original(True)
         if k == Qt.Key_Z:
             return self._dust_zoom()
         if k == Qt.Key_F:
             return self._dust_fit()
-        if k in (Qt.Key_N, Qt.Key_Right, Qt.Key_Down):
-            return self._dust_next(1)
-        if k in (Qt.Key_P, Qt.Key_Left, Qt.Key_Up):
-            return self._dust_next(-1)
 
     def _square_up(self):
         """Put the frames back on the grid the film puts them on.
@@ -4362,7 +4563,7 @@ class Editor(QMainWindow):
         self.status.setText(f"measured {len(found)} again")
 
     def _light_falloff(self):
-        """`⌘L`: which calibration of the copy stand's light falloff the
+        """`⇧⌘L`: which calibration of the copy stand's light falloff the
         roll is divided by, or a new one made from blank frames
         (`rigs.py`). Changing it measures the roll again -- the base and
         the balance are read through it (`measured_ready`) -- and nothing
@@ -4385,7 +4586,7 @@ class Editor(QMainWindow):
         self.status.setText(f"light falloff: {flat or 'none'} — the roll measured again")
 
     def _look(self):
-        """`⌘K`: the roll's taste -- exposure, warmth, tint, the curve's two
+        """`⌘L`: the roll's taste -- exposure, warmth, tint, the curve's two
         slopes, its contrast and pivot, saturation -- moved by eye on the roll's own frames
         (`look.py`), and kept in `roll.develop`, where the canvas and `⌘R`
         read it. One look for the roll, never one per frame."""
@@ -4416,24 +4617,32 @@ class Editor(QMainWindow):
         self._prefetch_later(200)
         self.status.setText(said)
 
-    def _process(self):
+    def _process_scan(self):
+        """`⇧⌘R`: the same sheet, on *only this photo* -- marking its dust
+        or setting the look on it, and wanting the file, is the usual
+        reason to process one."""
+        self._process(alone=True)
+
+    def _process(self, alone=False):
         """`⌘R`: what should come out of this roll. One sheet for both
         outputs, because they are one question, and the work then runs in
         the progress window."""
         import os
         from . import develop, positive, processing
         from .progress import Running
-        want = processing.ask(self.doc, self)
+        chosen = [self.names[r] for r in self._chosen_rows()]
+        want = processing.ask(self.doc, self, chosen, alone)
         if not want:
             return
+        only = want.get("only")
         # The roll may still be developing itself in the background. The
         # job wants every core there is, and the pictures it makes are
         # better than the ones the prefetch would: they come off the
         # full-size render it is about to do anyway.
         self._stop_prefetch()
         doc, roll = self.doc, self.roll
-        n = sum(len(it["parts"]) for it in doc["items"].values()
-                if it["state"] != "skipped")
+        n = sum(len(it["parts"]) for name, it in doc["items"].items()
+                if it["state"] != "skipped" and (only is None or name in only))
         if not n:
             return self.status.setText("nothing to process: no frames yet")
         workers = min(8, os.cpu_count() or 1)
@@ -4461,10 +4670,10 @@ class Editor(QMainWindow):
             def job(progress):
                 out_dir = roll / "developed"
                 results, ev = develop.develop_roll(roll, doc, out_dir, taste,
-                                                   workers, progress, stats)
-                develop.record(out_dir, taste, ev, results)
+                                                   workers, progress, stats, only)
+                develop.record(out_dir, taste, ev, results, only)
                 return results, ev
-            dlg = Running("Developing", f"{n} frames of {roll.name} into "
+            dlg = Running("Developing", f"{n} frame{'s' if n != 1 else ''} of {roll.name} into "
                           f"developed/, as {want['format']}.", job, self)
             dlg.exec()
             if dlg.result is not None:
@@ -4488,10 +4697,10 @@ class Editor(QMainWindow):
             def job2(progress):
                 out_dir = roll / "frames"
                 results, ev = positive.write_roll(roll, doc, out_dir, settings,
-                                                  workers, progress, stats)
-                positive.record(out_dir, settings, ev, results)
+                                                  workers, progress, stats, only)
+                positive.record(out_dir, settings, ev, results, only)
                 return results, ev
-            dlg = Running("Writing raws", f"{n} frames of {roll.name} as "
+            dlg = Running("Writing raws", f"{n} frame{'s' if n != 1 else ''} of {roll.name} as "
                           f"positive DNGs into frames/, {want['crop']} crop"
                           + (", dust marks filled on the mosaic."
                              if settings["dust"] else "."),
@@ -4513,10 +4722,10 @@ class Editor(QMainWindow):
                 results = negative.write_roll(
                     roll, doc, out_dir, taste, want["crop"], workers, progress,
                     stats, pictures=want["positives"], raws=want["raws"],
-                    compress=bool(want.get("compress", True)))
-                negative.record(out_dir, taste, want["crop"], results)
+                    compress=bool(want.get("compress", True)), only=only)
+                negative.record(out_dir, taste, want["crop"], results, only)
                 return results
-            dlg = Running("Writing negatives", f"{n} frames of {roll.name}, "
+            dlg = Running("Writing negatives", f"{n} frame{'s' if n != 1 else ''} of {roll.name}, "
                           f"not inverted, as {what} into {negative.FOLDER}/.",
                           job3, self)
             dlg.exec()
@@ -4565,6 +4774,9 @@ class Editor(QMainWindow):
         if name and develop.with_specks(self.item() or {}, self.doc,
                                         name).get("base_sample"):
             return f'<span style="color:{SUN}">BASE: PICKED (⇧B)</span>'
+        if name and develop.with_specks(self.item() or {}, self.doc,
+                                        name).get("base_colour"):
+            return f'<span style="color:{SUN}">BASE: PICKED FOR THE ROLL (⇧B)</span>'
         trust, unit = self._base_choice(name)
         if unit:
             return f'<span style="color:{REF}">BASE: THE ROLL</span>'
@@ -4603,7 +4815,7 @@ class Editor(QMainWindow):
         self.dev_plain.clear()
         self.dev_ev.clear()
         # Every picture the roll had made of itself was of the old base.
-        # **Debounced.** `⌘B` walks three positions and `⌘L` three answers,
+        # **Debounced.** `⌘B` walks three positions and `⇧⌘L` three answers,
         # and starting a pool of six processes on each of them -- and
         # killing it a keypress later -- is how a window that should have
         # been idle came to leave broken pipes behind. One press of a key
@@ -4681,15 +4893,21 @@ class Editor(QMainWindow):
         self._fill_list()          # every number after this one moved
 
     def _undo(self):
+        self._dust_clone_cancel()
         if not self.undo:
             return self.status.setText("nothing to undo")
         n, snap = self.undo.pop()
         if n == self.LOOK:
             self.redo.append((n, self._look_now()))
             return self._set_look(snap, "look put back", undoable=False)
+        if n == self.DUST:
+            name, old = snap
+            self.redo.append((n, (name, copy.deepcopy(
+                (self.doc.get("specks") or {}).get(name)))))
+            return self._set_dust(name, old, "dust marks put back")
         if n == self.BASE:
             name, old = snap
-            self.redo.append((n, (name, (self.doc.get("bases") or {}).get(name))))
+            self.redo.append((n, (name, self._base_of(name))))
             return self._set_base(name, old, "base put back", undoable=False)
         if n == self.ORDER:
             here = self.name()
@@ -4708,15 +4926,21 @@ class Editor(QMainWindow):
         self._goto(n)
 
     def _redo(self):
+        self._dust_clone_cancel()
         if not self.redo:
             return self.status.setText("nothing to redo")
         n, snap = self.redo.pop()
         if n == self.LOOK:
             self.undo.append((n, self._look_now()))
             return self._set_look(snap, "look redone", undoable=False)
+        if n == self.DUST:
+            name, new = snap
+            self.undo.append((n, (name, copy.deepcopy(
+                (self.doc.get("specks") or {}).get(name)))))
+            return self._set_dust(name, new, "dust marks redone")
         if n == self.BASE:
             name, new = snap
-            self.undo.append((n, (name, (self.doc.get("bases") or {}).get(name))))
+            self.undo.append((n, (name, self._base_of(name))))
             return self._set_base(name, new, "base redone", undoable=False)
         if n == self.ORDER:
             here = self.name()
@@ -4859,23 +5083,59 @@ class Editor(QMainWindow):
 
     # ---- the scan's own base (`⇧B`)
     BASE = "#base"       # an undo entry that is one scan's picked base
-    LOOK = "#look"       # an undo entry that is the roll's look (`⌘K`)
+    DUST = "#dust"       # an undo entry that is one scan's dust marks
+    LOOK = "#look"       # an undo entry that is the roll's look (`⌘L`)
+
+    ROLL_BASE = ""       # the name a base picked for the whole roll goes by
+
+    def _base_of(self, name):
+        """The base picked for this scan, or for the roll (`ROLL_BASE`)."""
+        if name == self.ROLL_BASE:
+            return self.doc["roll"].get("base_pick")
+        return (self.doc.get("bases") or {}).get(name)
+
+    def _base_box(self, name):
+        """The box drawn on this scan: its own pick, or the roll's if it
+        was picked here."""
+        own = self._base_of(name) if name else None
+        whole = self._base_of(self.ROLL_BASE)
+        if not own and whole and whole.get("scan") == name:
+            own = whole
+        return tuple(own["box"]) if own else None
 
     def _pick_base(self):
         """`⇧B`: drag a box over unexposed film on this scan, and the scan
-        is developed against that film rather than the roll's.
+        -- or the whole roll -- is developed against that film rather than
+        the base the roll measured.
 
         For a scan copied under another light -- another session, another
         panel -- whose colour the roll's base, measured on the rest, cannot
-        take out (`develop.own_base`). On the whole scan, where the film
-        between the frames and along the edge is in sight. On a scan that
-        has one already, it takes it away: the roll's base again."""
+        take out (`develop.own_base`); or for a roll whose measured base
+        came out the wrong colour, which is the same correction on every
+        frame. On the whole scan, where the film between the frames and
+        along the edge is in sight. On a scan that has one already, it
+        takes it away; with one for the roll, it asks."""
+        from . import sheets
         name = self.name()
         if not name or not (self.item() or {}).get("parts"):
             return self.status.setText("no frame here to pick a base for")
-        if (self.doc.get("bases") or {}).get(name):
+        if self._base_of(name):
             return self._set_base(name, None, "the roll's base again on this "
                                   "scan (⇧B to pick one, ⌘Z to undo)")
+        whole = self._base_of(self.ROLL_BASE)
+        if whole:
+            got = sheets.ask(
+                "Film base", "The roll uses a base picked on "
+                + whole.get("scan", "a scan").rsplit(".", 1)[0] + ".",
+                "Remove it to go back to the base the roll measured, or "
+                "pick another.",
+                (("cancel", "Cancel", "cancel"), ("remove", "Remove it", "quiet"),
+                 ("pick", "Pick another…", "go")), self)
+            if got == "remove":
+                return self._set_base(self.ROLL_BASE, None, "the measured base "
+                                      "again on the roll (⌘Z to undo)")
+            if got != "pick":
+                return
         if self.cut:
             self._cut()
         self.canvas.picking_base = True
@@ -4889,14 +5149,13 @@ class Editor(QMainWindow):
         self.canvas.picking_base = False
         self.canvas._base_from = None
         self.canvas.unsetCursor()
-        own = (self.doc.get("bases") or {}).get(self.name() or "")
-        self.canvas.base_box = tuple(own["box"]) if own else None
+        self.canvas.base_box = self._base_box(self.name())
         self.canvas.update()
         if said:
             self.status.setText(said)
 
     def _base_picked(self, box):
-        from . import develop
+        from . import develop, sheets
         name = self.name()
         self.canvas.picking_base = False
         self.canvas.unsetCursor()
@@ -4906,31 +5165,59 @@ class Editor(QMainWindow):
             value = develop.base_sample(self.roll / name, box, self._flat_named())
         except Exception as e:
             return self._stop_pick(f"no base read: {e}")
-        flat = (self.doc["roll"].get("develop") or {}).get("flat")
-        own = {"box": [round(v, 1) for v in box], "value": value, "flat": flat}
         roll = (self.doc["roll"].get("measured") or {}).get("base_colour")
         g = max(value[1], 1e-6)
-        said = (f"this scan's base: R/G {value[0] / g:.3f}, B/G {value[2] / g:.3f}"
-                + (f" -- the roll's {roll[0]:.3f}, {roll[2]:.3f}" if roll else "")
-                + "  (⌘Z to undo)")
-        self._set_base(name, own, said)
+        read = (f"R/G {value[0] / g:.3f}, B/G {value[2] / g:.3f}"
+                + (f" -- the roll measured {roll[0]:.3f}, {roll[2]:.3f}"
+                   if roll else ""))
+        # **This scan, or the roll.** A scan copied under another light is
+        # the first; a roll whose measured base is off is the second, and
+        # picking it scan by scan would be the same box drawn on every one.
+        got = sheets.ask(
+            "Film base", "Use this base for this scan, or for the whole roll?",
+            read + ". For the roll, only its colour is used: each scan keeps "
+            "the level of its own exposure.",
+            (("cancel", "Cancel", "cancel"), ("roll", "The whole roll", "quiet"),
+             ("scan", "This scan", "go")), self)
+        if got not in ("scan", "roll"):
+            return self._stop_pick("no base picked")
+        flat = (self.doc["roll"].get("develop") or {}).get("flat")
+        own = {"box": [round(v, 1) for v in box], "value": value, "flat": flat}
+        if got == "roll":
+            own["scan"] = name
+            return self._set_base(self.ROLL_BASE, dict(own),
+                                  f"the roll's base, picked here: {read}  (⌘Z to undo)")
+        self._set_base(name, own, f"this scan's base: {read}  (⌘Z to undo)")
 
     def _set_base(self, name, own, said, undoable=True):
-        bases = self.doc.setdefault("bases", {})
         if undoable:
-            self.undo.append((self.BASE, (name, bases.get(name))))
+            self.undo.append((self.BASE, (name, self._base_of(name))))
             self.redo.clear()
-        if own:
-            bases[name] = own
+        if name == self.ROLL_BASE:
+            if own:
+                self.doc["roll"]["base_pick"] = own
+            else:
+                self.doc["roll"].pop("base_pick", None)
         else:
-            bases.pop(name, None)
+            bases = self.doc.setdefault("bases", {})
+            if own:
+                bases[name] = own
+            else:
+                bases.pop(name, None)
         self.dirty = True
-        self.base_cache.pop(name, None)
-        if name == self.name():
-            self.canvas.base_box = tuple(own["box"]) if own else None
-            self._say_base(name)
-        self._forget_developed(name)
-        if name == self.name():
+        here = self.name()
+        if name == self.ROLL_BASE:
+            self._stop_prefetch()
+            self.base_cache.clear()
+            self._forget_developed()
+            self._forget_modes()
+            self._prefetch_later(200)
+        else:
+            self.base_cache.pop(name, None)
+            self._forget_developed(name)
+        if name in (here, self.ROLL_BASE):
+            self.canvas.base_box = self._base_box(here)
+            self._say_base(here)
             # the positive and the scan views are drawn through the base
             # too, and were dropped with it: drawn again from scratch
             self._select(self.list.currentRow())
@@ -5072,8 +5359,7 @@ class Editor(QMainWindow):
                               mirrored=self.doc["roll"].get("mirrored", True),
                               scan_w=it["scan"][0])
         self.canvas.sel = min(sel, max(0, len(it["parts"]) - 1))
-        own = (self.doc.get("bases") or {}).get(name)
-        self.canvas.base_box = tuple(own["box"]) if own else None
+        self.canvas.base_box = self._base_box(name)
         self._say_base(name)
         if self.canvas.picking_base:
             self._stop_pick("")
@@ -5249,6 +5535,14 @@ class Editor(QMainWindow):
         pm, _ = self._pixmaps(name, self._frame_box(self.doc["items"][name]))
         self.canvas.pixmap = pm
         self.canvas.update()
+
+
+def _to_segment(p, a, b):
+    """Screen distance from the point `p` to the segment `a`-`b`."""
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    t = ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / max(dx * dx + dy * dy, 1e-9)
+    t = min(1.0, max(0.0, t))
+    return math.hypot(p.x() - a.x() - t * dx, p.y() - a.y() - t * dy)
 
 
 def _tip(text):

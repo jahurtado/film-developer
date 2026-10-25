@@ -142,7 +142,8 @@ def run(args):
     where = args.roll
     if not where:
         from .start import ask, remember
-        where = ask(identity())
+        from .about import signature
+        where = ask(identity(), signature())
         if not where:
             return 0
         remember(where)
@@ -199,6 +200,12 @@ def run(args):
     # back to a per-scan reading that is not what the develop uses. It is
     # kept in the document, so this is paid once per roll.
     if measure_base(roll, doc):
+        document.save(doc, roll)
+
+    # Dust marked before the brush, made brush marks: once, and needs the
+    # roll's measurement to develop the frames it is measured on.
+    from .progress import migrate_dust
+    if doc["roll"].get("measured") and migrate_dust(roll, doc):
         document.save(doc, roll)
 
     win = Editor(roll, doc, identity())

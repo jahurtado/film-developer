@@ -56,7 +56,7 @@ CALLABLE = (
     "_copy_frames", "_paste_frames", "_skip", "_reset",
     "_enter_mode", "_leave_mode", "_add_part", "_drop_part",
     # the roll
-    "_process", "_redetect", "_redetect_roll", "_look",
+    "_process", "_process_scan", "_redetect", "_redetect_roll", "_look",
     "_undo", "_redo", "_save", "_forget_base", "_forget_developed",
     # the canvas
     "_retone",

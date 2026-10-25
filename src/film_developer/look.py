@@ -1,4 +1,4 @@
-"""The roll's look, set by eye: `⌘K` in the editor.
+"""The roll's look, set by eye: `⌘L` in the editor.
 
 The develop has two halves. The automatics -- base, inversion, the roll's
 balance, each frame's exposure and shadow rule, the curve opening for a
@@ -13,7 +13,8 @@ This sheet moves them with the picture in front of you. It shows one frame
 at a time, cut to the frame's upright inner box and turned and mirrored as
 the roll shows it, and walks the roll with `‹` `›` (or `p` `n`) so a look
 chosen on one frame can be checked on the others before it goes to all of
-them. **Hold *before*** shows the frame under the look the roll has now.
+them. **Hold *before*** (or `c`, as everywhere) shows the frame under
+the look the roll has now.
 Contrast and pivot sit on the curve of the frame already normalised: see
 `develop.finish`.
 
@@ -175,7 +176,7 @@ class LookSheet(QDialog):
     def __init__(self, ed):
         super().__init__(ed)
         self.ed, self.doc, self.roll = ed, ed.doc, ed.roll
-        self.setWindowTitle("Develop look")
+        self.setWindowTitle("Roll look")
         self.setModal(True)
         self.base_taste = dict(develop.TASTE) | dict(self.doc["roll"].get("develop") or {})
         self.before = {k: float(self.base_taste[k]) for k in KEYS}
@@ -222,7 +223,7 @@ class LookSheet(QDialog):
         self.next_b.clicked.connect(lambda: self._walk(1))
         self.where = QLabel("")
         self.where.setStyleSheet(f"color: {SUB};")
-        self.hold_b = QPushButton("Hold to see before")
+        self.hold_b = QPushButton("Before (hold c)")
         self.hold_b.setFocusPolicy(Qt.NoFocus)
         self.hold_b.pressed.connect(lambda: self._hold(True))
         self.hold_b.released.connect(lambda: self._hold(False))
@@ -426,6 +427,19 @@ class LookSheet(QDialog):
     def _hold(self, on):
         self.holding = on
         self._render()
+
+    def keyPressEvent(self, e):
+        # `hold c`, as in the window and in the dust: the frame as it was
+        if e.key() == Qt.Key_C and not e.modifiers():
+            if not e.isAutoRepeat():
+                self._hold(True)
+            return
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key_C and not e.isAutoRepeat() and self.holding:
+            return self._hold(False)
+        super().keyReleaseEvent(e)
 
     def _render(self):
         key = self.frames[self.at] if self.frames else None

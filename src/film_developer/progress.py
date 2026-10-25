@@ -196,6 +196,23 @@ def measure_base(roll, doc, parent=None):
     return True
 
 
+def migrate_dust(roll, doc, parent=None):
+    """Dust marks from before the brush, made brush marks, once, when the
+    roll is opened (`develop.migrate_roll`). True if any were."""
+    from . import develop
+    names = develop.old_marks(doc)
+    if not names:
+        return False
+    dlg = Running("Updating the dust marks",
+                  f"{len(names)} scan{'s' if len(names) > 1 else ''} of "
+                  f"{pathlib.Path(roll).name} have dust marked before the "
+                  f"brush. Each mark is measured on its frame and kept as "
+                  f"a dab or a stroke. This happens once.",
+                  lambda progress: develop.migrate_roll(roll, doc, progress),
+                  parent)
+    dlg.exec()
+    return bool(dlg.result)
+
 class Running(QDialog):
     """The same window for any job that counts: a title, what it is doing,
     the bar, and the time left. `fn(progress)` runs in a thread and its

@@ -5,6 +5,7 @@
     film-developer roll ROLL_DIR --skip DSC_0491 DSC_0492
     film-developer roll ROLL_DIR --keep DSC_0491
     film-developer roll ROLL_DIR --same-base --same-size --flat "D5600 55mm"
+    film-developer roll ROLL_DIR --pick-base DSC_0419 300 120 900 260 --for-roll
 
 Everything the window decides about a roll as a whole, and the one thing it
 decides about a scan without measuring -- whether it is developed at all
@@ -19,6 +20,7 @@ developed, by `process`. The output says which.
 """
 
 import json
+import pathlib
 import sys
 
 from . import develop, document, flatfield
@@ -66,6 +68,15 @@ def add_args(ap):
                     default=None,
                     help="the shot number in front of every file name")
     ap.add_argument("--not-numbered", dest="numbered", action="store_false")
+    ap.add_argument("--pick-base", nargs=5, metavar=("SCAN", "X0", "Y0", "X1", "Y1"),
+                    help="`⇧B`: the film base read in this box of unexposed "
+                         "film, in scan pixels; for that scan, or with "
+                         "--for-roll its colour for every scan")
+    ap.add_argument("--for-roll", action="store_true",
+                    help="with --pick-base: for the whole roll")
+    ap.add_argument("--no-picked-base", nargs="+", metavar="SCAN",
+                    default=[], help="take a picked base away: a scan's, or "
+                                     "`roll` for the roll's")
 
 
 def _named(doc, names):
@@ -108,6 +119,8 @@ def summary(doc):
         "same_base": dev.get("base", "auto") != "frame",
         "flat": dev.get("flat"),
         "numbered": r.get("numbered", True),
+        "picked_base": {"roll": (r.get("base_pick") or {}).get("scan"),
+                        "scans": sorted(doc.get("bases") or {})},
         "measured": develop.measured_ready(r.get("measured"), dev),
         "taste": {k: dev[k] for k in develop.TASTE
                   if k not in ("base", "flat", "format", "order")},
@@ -167,6 +180,32 @@ def run(args):
     if args.numbered is not None:
         r["numbered"] = args.numbered
         said.append(f"numbered {args.numbered}")
+    for q in args.no_picked_base:
+        if q == "roll":
+            if r.pop("base_pick", None):
+                said.append("the roll's picked base removed")
+            continue
+        for name in _named(doc, [q]):
+            if (doc.get("bases") or {}).pop(name, None):
+                said.append(f"{name}: picked base removed")
+    if args.pick_base:
+        # What `⇧B` does, from a box a person or a program already knows:
+        # the median of unexposed film inside it, under the roll's falloff.
+        name = _named(doc, [args.pick_base[0]])[0]
+        box = [float(v) for v in args.pick_base[1:]]
+        taste = dict(develop.TASTE) | dict(dev)
+        value = develop.base_sample(pathlib.Path(args.roll) / name, box,
+                                    flatfield.of(taste))
+        own = {"box": box, "value": value, "flat": taste.get("flat")}
+        g = max(value[1], 1e-6)
+        read = f"R/G {value[0] / g:.3f}, B/G {value[2] / g:.3f}"
+        if args.for_roll:
+            r["base_pick"] = own | {"scan": name}
+            said.append(f"the roll's base picked on {name}: {read} "
+                        "(its colour, on every scan without its own)")
+        else:
+            doc.setdefault("bases", {})[name] = own
+            said.append(f"{name}: base picked, {read}")
     if said:
         document.save(doc, args.roll)
     s = summary(doc)

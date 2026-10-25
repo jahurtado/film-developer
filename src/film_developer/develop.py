@@ -78,6 +78,7 @@ developed under another. What it corrected it no longer corrects.
 """
 
 import json
+import re
 import math
 import pathlib
 import sys
@@ -715,7 +716,14 @@ def base_of(reb_base, top, roll_ratio, trust_rebate=True, pooled=None):
 def own_base(item, roll_ratio, trust_rebate, pooled):
     """(colour, trust, level) with the scan's own base, when a person picked
     one (`⇧B`, `doc["bases"]`, put on the item by `with_specks` as
-    `base_sample`); the roll's three otherwise.
+    `base_sample`); with a base picked for the whole roll
+    (`roll.base_pick`, put on as `base_colour`), its colour and the roll's
+    level; the roll's three otherwise.
+
+    **For the roll, only the colour.** The level is a scan's exposure of
+    the copy, and one scan's green is every other scan's only when they
+    were all copied alike; the roll's pooled level already says that, per
+    unit of exposure. The colour is the film's, and the same on every frame.
 
     **A scan copied under another light needs its own base**: two scans
     of one negative, copied on another day, came into a roll and developed
@@ -733,6 +741,11 @@ def own_base(item, roll_ratio, trust_rebate, pooled):
     does (`base_of`: still floored by the frame's own lightest pixels)."""
     smp = item.get("base_sample") if item else None
     if not smp:
+        tint = item.get("base_colour") if item else None
+        if tint:
+            r, g, b = (float(v) for v in tint)
+            g = max(g, 1e-6)
+            return [r / g, 1.0, b / g], trust_rebate, pooled
         return roll_ratio, trust_rebate, pooled
     r, g, b = (float(v) for v in smp)
     g = max(g, 1e-6)
@@ -1103,7 +1116,7 @@ def _render(pos, scale, taste, look, quick=False, applied=None, px=1.0):
     k = min(max(SPAN_FLOOR / max(span, 1e-3), 1.0),
             SLOPE_MAX / max(taste["shadows"], taste["highlights"], 1e-3))
     # **Contrast after the opening, pivot on the normalised picture**
-    # (`⌘K`). Contrast multiplies both slopes once each
+    # (`⌘L`). Contrast multiplies both slopes once each
     # frame has opened its own: before it, the opening would undo a
     # lower contrast on every flat frame, which are the ones that
     # ask for it. The pivot is where the curve bends, in EV over
@@ -1167,7 +1180,7 @@ def finish(pos, roll_wb, blank, taste, look_box=None, px=1.0, applied=None):
     the noise reduction and the sharpening. `applied` is another call's
     `ev["applied"]`: its decisions -- balance, exposure, slopes, black --
     are taken as they are instead of being measured here, so a crop of a
-    frame at full size develops as the whole frame did (`⌘K`'s 100 %).
+    frame at full size develops as the whole frame did (`⌘L`'s 100 %).
 
     **The order**, and why: the balance; the **noise reduction**, in
     scene-linear light, after the balance so the colour is smoothed about
@@ -1278,7 +1291,7 @@ def finish(pos, roll_wb, blank, taste, look_box=None, px=1.0, applied=None):
         "shadow_slope": round(slope, 3),
         "highlight_slope": round(high, 3),
         "black": round(float(sub), 4),
-        # The parts, for the window's "What the develop did": the balance
+        # The parts, for the window's "Development details": the balance
         # is the roll's, this frame's own pull off it, and the taste; the
         # exposure is the automatic one before the taste's and the shadow
         # rule's. `exposure` above is all three.
@@ -1348,7 +1361,7 @@ def _full_positive(path, item, part, matrix, roll_ratio, taste, trust, pooled,
 
 def full_positive(path, item, part, stats, taste, one_roll=True):
     """A frame's positive at full size, with the base chosen as
-    `develop_frame` chooses it: what `⌘K`'s 100 % view crops."""
+    `develop_frame` chooses it: what `⌘L`'s 100 % view crops."""
     trust, unit = base_choice(stats, taste, one_roll)
     pooled = (unit * (scan_exposure(path) or 0)) if unit else None
     pos, _d, _b, _r, _t = _full_positive(path, item, part, stats["matrix"],
@@ -1398,9 +1411,10 @@ def with_specks(item, doc, name):
     """`item` with what a person said about the scan on it, for a develop
     job: the dust -- the marks made by hand and the found ones a person
     accepted (`dust.used`) -- and the scan's own base, if one was picked
-    (`own_base`) under the light-falloff calibration now in force; one
-    picked under another was read through other numbers and is left out
-    until it is picked again."""
+    (`own_base`), or else the colour of the one picked for the whole roll,
+    under the light-falloff calibration now in force; one picked under
+    another was read through other numbers and is left out until it is
+    picked again."""
     from . import dust
     marks = [m for m in (doc.get("specks") or {}).get(name, {}).get("marks") or []
              if dust.used(m)]
@@ -1409,8 +1423,116 @@ def with_specks(item, doc, name):
     own = (doc.get("bases") or {}).get(name)
     flat = (doc["roll"].get("develop") or {}).get("flat")
     if own and own.get("value") and own.get("flat") == flat:
-        item = dict(item, base_sample=own["value"])
+        return dict(item, base_sample=own["value"])
+    whole = doc["roll"].get("base_pick")
+    if whole and whole.get("value") and whole.get("flat") == flat:
+        item = dict(item, base_colour=whole["value"])
     return item
+
+
+def old_marks(doc):
+    """The scans whose dust has marks from before the brush: a hand mark
+    that is a point and not a path (`dust.samples`)."""
+    return [name for name, rec in (doc.get("specks") or {}).items()
+            if name in doc.get("items", {})
+            and any(not m.get("path") and m.get("by", "hand") == "hand"
+                    for m in rec.get("marks") or [])]
+
+
+def migrate_marks(roll, doc, name, stats, taste, one_roll=True):
+    """The scan's marks from before the brush, made brush marks, in the
+    document. How many were.
+
+    Each is measured on its frame's positive at full size, before any
+    dust is out -- the picture `clean` grew it on -- by `dust.migrate`,
+    and written back as a dab, a stroke along a hair, or a soft dab. Its
+    number stays. One outside every frame was taking nothing out and is
+    left as it is."""
+    import pathlib
+    from . import dust
+    item = doc["items"][name]
+    marks = doc["specks"][name]["marks"]
+    old = [i for i, m in enumerate(marks)
+           if not m.get("path") and m.get("by", "hand") == "hand"]
+    done, was_sized = 0, {}
+    for part in item.get("parts") or []:
+        if not old:
+            break
+        pos = full_positive(pathlib.Path(roll) / name, item, part, stats,
+                            taste, one_roll)
+        H, W = pos.shape[:2]
+        a = np.array(frame_to_scan(item, part, taste))
+        inv = np.linalg.inv(a[:, :2])
+        to_scan = lambda x, y: [round(float(v), 1) for v in a[:, :2] @ (x, y) + a[:, 2]]
+        for i in list(old):
+            m = marks[i]
+            x, y = inv @ (np.array([m["x"], m["y"]]) - a[:, 2])
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            if m.get("r"):
+                was_sized[i] = (m["x"], m["y"], m["r"])
+            got = dust.migrate(pos, x, y, m.get("r"), 1.0)
+            new = {k: m[k] for k in ("id",) if k in m}
+            if got[0] == "stroke":
+                path = [to_scan(*p) for p in got[1]]
+                new.update(path=path, r=round(got[2], 1))
+            else:
+                path = [to_scan(got[1], got[2])]
+                new.update(path=path, r=round(got[3], 1))
+                if got[0] == "soft":
+                    new["soft"] = True
+            mid = path[len(path) // 2]
+            marks[i] = {"x": mid[0], "y": mid[1], **new, "by": "hand"}
+            old.remove(i)
+            done += 1
+    # a chain of sized discs along one hair is one stroke through their
+    # middles, as wide as its widest disc; it keeps the first one's number
+    sized = [i for i, m in enumerate(marks) if m.get("by", "hand") == "hand"
+             and not m.get("soft") and was_sized.get(i)]
+    gone = set()
+    for chain in dust.chains([(was_sized[i][0], was_sized[i][1], was_sized[i][2])
+                              for i in sized]):
+        idx = [sized[c] for c in chain]
+        path = [[was_sized[i][0], was_sized[i][1]] for i in idx]
+        first = min(idx, key=lambda i: marks[i].get("id", 0))
+        mid = path[len(path) // 2]
+        marks[first] = {"x": mid[0], "y": mid[1],
+                        **({"id": marks[first]["id"]} if "id" in marks[first] else {}),
+                        "path": path, "r": max(was_sized[i][2] for i in idx),
+                        "by": "hand"}
+        gone |= set(idx) - {first}
+    marks[:] = [m for i, m in enumerate(marks) if i not in gone]
+    return done
+
+
+def migrate_roll(roll, doc, progress=None):
+    """`migrate_marks` over every scan that needs it, with the roll's
+    measurement; how many marks were made brush marks. Opening the roll
+    does it (`progress.migrate_dust`) and so does `process`.
+
+    **Once, and automatically**, because a point grown into the speck under
+    it meant *whatever is here* and only the picture says how big that
+    was, so this is the one moment the old meaning can be written down.
+    The document as it was is kept beside it the first time,
+    `frames.before-brush.json`."""
+    import pathlib
+    import shutil
+    names = old_marks(doc)
+    if not names or not doc["roll"].get("measured"):
+        return 0
+    taste = dict(TASTE) | dict(doc["roll"].get("develop") or {})
+    stats = stats_of(doc["roll"]["measured"], taste, roll)
+    one = doc["roll"].get("one_roll", True)
+    here = pathlib.Path(roll) / "frames.json"
+    keep = pathlib.Path(roll) / "frames.before-brush.json"
+    if here.exists() and not keep.exists():
+        shutil.copy2(here, keep)
+    n = 0
+    for i, name in enumerate(names):
+        if progress:
+            progress(i, len(names))
+        n += migrate_marks(roll, doc, name, stats, taste, one)
+    return n
 
 
 def develop_frame(path, item, part, stats, taste, one_roll=True):
@@ -1531,6 +1653,32 @@ def out_stem(doc, path, item, part):
     return stem
 
 
+def kept(out_dir, record_name, results, only=None):
+    """The frames a record lists after this run, the old files it replaced
+    removed (`sweep`). A run over the whole roll lists what it wrote. A run
+    over a few scans (`only`) **adds to the record**: the rest of the roll's
+    files are still there and still the roll's, so only the old files of
+    those scans -- the same scan under another number -- go."""
+    if only is None:
+        sweep(out_dir, record_name, results)
+        return results
+    out_dir = pathlib.Path(out_dir)
+    try:
+        old = json.loads((out_dir / record_name).read_text()).get("frames") or {}
+    except (OSError, ValueError):
+        old = {}
+    stems = {pathlib.Path(n).stem for n in only}
+
+    def of_these(f):
+        s = re.sub(r"^\d+_", "", pathlib.Path(f).stem)
+        return re.sub(r"-[ab]$", "", s) in stems
+    for k in old:
+        f = out_dir / k
+        if of_these(k) and k not in results and f.parent == out_dir and f.is_file():
+            f.unlink()
+    return {k: v for k, v in old.items() if not of_these(k)} | results
+
+
 def sweep(out_dir, record_name, keep):
     """Remove the files the previous run recorded in `record_name` and this
     one did not write: a renumbered roll, or numbering switched on or off,
@@ -1552,13 +1700,16 @@ def sweep(out_dir, record_name, keep):
     return gone
 
 
-def frames_of(roll_dir, doc):
-    """(path, item, part) for every frame the document says to develop."""
+def frames_of(roll_dir, doc, only=None):
+    """(path, item, part) for every frame the document says to develop, or
+    for the scans named in `only`."""
     roll_dir = pathlib.Path(roll_dir)
     out = []
     for name, item in sorted(doc["items"].items()):
         path = roll_dir / name
         if item["state"] == "skipped" or not item["parts"] or not path.exists():
+            continue
+        if only is not None and name not in only:
             continue
         item = with_specks(item, doc, name)
         for part in item["parts"]:
@@ -1789,7 +1940,7 @@ def render_sample(s, stats, taste, mirrored, turn=0):
 
 
 def develop_roll(roll_dir, doc, out_dir, taste, workers, progress=None,
-                 stats=None):
+                 stats=None, only=None):
     """Every frame of the document: the roll's statistics unless given,
     then each frame at full size. Returns ({output name: evidence}, roll).
 
@@ -1799,7 +1950,7 @@ def develop_roll(roll_dir, doc, out_dir, taste, workers, progress=None,
     processed can then be walked frame by frame with the develop on screen
     and nothing left to compute.
     """
-    frames = frames_of(roll_dir, doc)
+    frames = frames_of(roll_dir, doc, only)
     if not frames:
         return {}, {}
     if stats is None:
@@ -1837,12 +1988,12 @@ def develop_roll(roll_dir, doc, out_dir, taste, workers, progress=None,
     return results, roll_evidence
 
 
-def record(out_dir, taste, roll_ev, results):
+def record(out_dir, taste, roll_ev, results, only=None):
     """`developed.json` beside the positives: the settings, what the roll
-    measured, and the evidence for every frame."""
+    measured, and the evidence for every frame (`kept`)."""
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sweep(out_dir, "developed.json", results)
+    results = kept(out_dir, "developed.json", results, only)
     (out_dir / "developed.json").write_text(json.dumps(
         {"settings": taste, "roll": roll_ev, "frames": results}, indent=1) + "\n")
 

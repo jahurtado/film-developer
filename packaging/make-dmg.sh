@@ -83,7 +83,7 @@ Control-clicking the icon and choosing Open used to work; Apple removed
 that shortcut in macOS 15.
 
 Apple Silicon only. On an Intel Mac, install from source instead:
-https://www.elcacharrista.com
+https://github.com/jahurtado/film-developer#run-from-source
 TXT
 hdiutil create -volname "film-developer $version" -srcfolder dist/dmg \
     -ov -format UDZO "$dmg" >/dev/null

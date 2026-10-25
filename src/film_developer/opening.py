@@ -319,7 +319,7 @@ def ask(name, n, doc, workers=8, parent=None, warning="", action="Measure"):
     rig_say = QLabel(
         "The copy stand's light falloff, divided out before the base and "
         "the balance are read. Made once per setup from blank frames, and "
-        "offered to every roll from then on; ⌘L changes it later.")
+        "offered to every roll from then on; ⇧⌘L changes it later.")
 
     def made():
         from . import rigs
