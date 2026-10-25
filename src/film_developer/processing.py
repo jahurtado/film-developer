@@ -67,7 +67,7 @@ def ask(doc, parent=None, chosen=(), alone=False):
     v.setContentsMargins(26, 22, 26, 18)
     v.setSpacing(12)
 
-    head = QLabel("What should come out of this roll?")
+    head = QLabel("Files to write")
     head.setStyleSheet("font-size: 15px;")
     v.addWidget(head)
 

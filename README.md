@@ -103,7 +103,7 @@ area: view, crop, colour, dust and process.
 
 <p align="center">
   <img src="docs/images/frames.png" width="400"
-       alt="Placing the frame by hand: its corners, and the film base picked beside it">
+       alt="Placing the frame by hand: its corners">
   &nbsp;
   <img src="docs/images/dust.png" width="400"
        alt="Marking dust by hand, on the frame developed at full size">
@@ -118,9 +118,9 @@ picture around it.
 
 <p align="center">
   <img src="docs/images/dust-before-after.jpg" width="560"
-       alt="Four dust examples: before, the marks, and after">
+       alt="Three dust examples: before, the marks, and after">
   <br>
-  <sub>Before, the marks, and the developed photo. A hair across two wires, then three on a frame of the Alhambra: a fibre by a window, a fibre in the sky, and a soft blur of dust.</sub>
+  <sub>Before, the marks, and the developed photo. A hair across two wires, then two fibres on a frame of the Alhambra: one by a window and one in the sky.</sub>
 </p>
 
 ## How it works

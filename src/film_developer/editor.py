@@ -4624,7 +4624,7 @@ class Editor(QMainWindow):
         self._process(alone=True)
 
     def _process(self, alone=False):
-        """`⌘R`: what should come out of this roll. One sheet for both
+        """`⌘R`: the files to write for this roll. One sheet for both
         outputs, because they are one question, and the work then runs in
         the progress window."""
         import os
